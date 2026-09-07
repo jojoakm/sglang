@@ -367,6 +367,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        self.decode_hit_tokens = 0
+        self.decode_fill_tokens = 0
         # In-flight authoritative room -> DP-rank lookups, consumed below.
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
@@ -1520,6 +1522,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             self._num_published_destinations += 1
             preallocated_reqs.append(decode_req)
+            if not decode_req.req.retracted_stain:
+                self.decode_hit_tokens += total_prefix_len
+                self.decode_fill_tokens += self._pre_alloc_fill_len(decode_req.req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 

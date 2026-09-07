@@ -874,12 +874,22 @@ class SchedulerMetricsReporter:
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
         cache_hit_rate = 0.0
+        decode_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+            prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+            hit_tokens = prealloc_queue.decode_hit_tokens
+            fill_tokens = prealloc_queue.decode_fill_tokens
+            if fill_tokens > 0:
+                decode_hit_rate = hit_tokens / fill_tokens
+                msg += (
+                    f"decode_hit_rate: {decode_hit_rate:.4f} "
+                    f"(hit={hit_tokens}, fill={fill_tokens}), "
+                )
 
         if (
             get_disagg().language_only
@@ -933,6 +943,7 @@ class SchedulerMetricsReporter:
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.decode_hit_rate = decode_hit_rate
             self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
 
             # Memory pool usage ratios / Absolute token counts
