@@ -802,6 +802,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if envs.SGLANG_DISAGG_OWNER_LAYER_RECEIVE.get():
+            from sglang.srt.mem_cache.owner_layer_receive import mapped_tp4_owner_layers
+
+            parallel = get_parallel()
+            if (
+                self.transfer_backend != TransferBackend.MOONCAKE
+                or not self.is_mla_backend
+                or not workqueue_isolation_enabled()
+                or (parallel.tp_size, parallel.attn_tp_size, self.pp_size) != (4, 4, 1)
+                or get_disagg().disaggregation_decode_host_receive_threshold != 0
+                or not self.tree_cache.disable
+                or self.host_pool.page_size != 64
+                or not kv_manager.supports_host_destination
+                or self.host_pool.can_use_jit
+                or self.tree_cache.cache_controller.io_backend != "kernel"
+            ):
+                raise ValueError("Owner-layer host receive requires the TP4 Mooncake Q register-kernel layout")
+            owner_context = mapped_tp4_owner_layers(self.host_pool, self.gloo_group, self.tp_rank)
+            self.tree_cache.owner_layer_views = owner_context.__enter__()
+            self.tree_cache.owner_layer_context = owner_context
+            self.tree_cache.owner_layer_group = self.gloo_group
+            self.tree_cache.owner_layer_trace_room = envs.SGLANG_MOONCAKE_OWNER_MLA_TRACE_ROOM.get()
+            kv_manager.owner_layer_receive_ready = True
         if (
             get_disagg().disaggregation_decode_host_receive_threshold < 1
             and not kv_manager.supports_host_destination
@@ -1973,6 +1996,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         assert decode_req.req.kv.retraction_backup is None
         decode_req.req.kv.retraction_backup = RetractionBackup(
             host_indices=host_indices,
+            owner_layer_receive=getattr(self.kv_manager, "owner_layer_receive_ready", False),
             pool_transfers=transfers
             + [
                 PoolTransfer(
@@ -3163,6 +3187,28 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
+
+    def wait_for_host_writers(self) -> None:
+        """Shutdown only: certify existing host destinations without opening new rooms."""
+        from itertools import chain
+
+        outstanding = []
+        for req in chain(self.queue, (entry[0] for entry in self._deferred_releases)):
+            if self._is_host_destination(req):
+                receiver = req.kv_receiver
+                if receiver.poll() != KVPoll.Success:
+                    # Partial metadata delivery can leave init_time unset.
+                    receiver.ensure_abort_notified(force_arm=True)
+                    outstanding.append(receiver)
+        while outstanding:
+            outstanding = [
+                receiver for receiver in outstanding
+                if receiver.poll() != KVPoll.Success and not receiver.is_abort_release_safe()
+            ]
+            if outstanding:
+                # A timeout does not certify a writer. The tokenizer's existing
+                # whole-group shutdown deadline owns a non-responding peer.
+                time.sleep(0.01)
 
     def _observe_deferred_kv_release(
         self, duration_seconds: float, outcome: str
