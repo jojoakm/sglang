@@ -3436,66 +3436,53 @@ class SchedulerDisaggregationDecodeMixin:
 
         num_not_used_batch = batch_size - curr_batch_size
 
-        # pop req from waiting queue
         can_run_list: List[Req] = []
+        restoring: List[Req] = []
         waiting_queue: List[Req] = []
 
         for i, req in enumerate(self.waiting_queue):
-            # The opt-in batch path reserves its candidate prefix while copies
-            # are pending. Otherwise retain the native ready-request admission.
-            candidate = (
-                i < num_not_used_batch
-                if batched_restore
-                else len(can_run_list) < num_not_used_batch
-                and (
-                    not host_restore
-                    or req.kv.restore_done_event is None
-                    or id(req) in restores_ready
-                )
+            pending_copy = (
+                req.kv.restore_done_event is not None and id(req) not in restores_ready
             )
-            if candidate:
-                can_run_list.append(req)
-                if req.kv.restore_done_event is not None and (
-                    not batched_restore or id(req) in restores_ready
-                ):
-                    finish_restore_kv_cache(req, self.tree_cache)
-                # `pop_preallocated` matched and locked new requests; a retracted or
-                # rebootstrapped one owns its row, and a re-match here takes no lock.
-                if get_disagg().disaggregation_decode_enable_radix_cache:
-                    if req.last_node is None:
-                        _bind_root_prefix(req, self.tree_cache)
-                    tree_cache = None
-                else:
-                    tree_cache = self.tree_cache
-                req.init_next_round_input(tree_cache)
-                # Truncate fill_len to kv_committed_len so checkpoint
-                # only sees committed KV (full array includes one uncommitted
-                # token because init_next_round_input rebuilt it as full).
-                if req.kv.kv_committed_len is not None:
-                    req.extend_end = req.kv.kv_committed_len
-            else:
+            pending_restore = batched_restore and (
+                req.kv.retraction_backup is not None or pending_copy
+            )
+            # Pending restores keep their candidate prefix without using ready slots.
+            has_slot = (
+                i < num_not_used_batch
+                if pending_restore
+                else len(can_run_list) < num_not_used_batch
+                and (not host_restore or not pending_copy)
+            )
+            if not has_slot:
                 waiting_queue.append(req)
+                continue
 
-        if batched_restore:
-            restoring = [
-                req for req in can_run_list if req.kv.retraction_backup is not None
-            ]
-            if restoring and self.tree_cache.has_free_load_back_slot():
-                self._start_host_restore_batch(restoring)
-            pending = []
-            ready = []
-            for req in can_run_list:
-                if req.kv.retraction_backup is not None or (
-                    req.kv.restore_done_event is not None
-                    and id(req) not in restores_ready
-                ):
-                    pending.append(req)
-                else:
-                    if req.kv.restore_done_event is not None:
-                        finish_restore_kv_cache(req, self.tree_cache)
-                    ready.append(req)
-            waiting_queue = pending + waiting_queue
-            can_run_list = ready
+            if req.kv.restore_done_event is not None and (
+                not batched_restore or not pending_copy
+            ):
+                finish_restore_kv_cache(req, self.tree_cache)
+            # Pop already matched and locked new requests. A re-match here takes no lock.
+            if get_disagg().disaggregation_decode_enable_radix_cache:
+                if req.last_node is None:
+                    _bind_root_prefix(req, self.tree_cache)
+                tree_cache = None
+            else:
+                tree_cache = self.tree_cache
+            req.init_next_round_input(tree_cache)
+            # Only the committed KV is available for the prebuilt batch.
+            if req.kv.kv_committed_len is not None:
+                req.extend_end = req.kv.kv_committed_len
+
+            if pending_restore:
+                waiting_queue.append(req)
+                if req.kv.retraction_backup is not None:
+                    restoring.append(req)
+            else:
+                can_run_list.append(req)
+
+        if restoring and self.tree_cache.has_free_load_back_slot():
+            start_restore_kv_cache_batch(restoring, self.tree_cache)
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
@@ -3561,14 +3548,6 @@ class SchedulerDisaggregationDecodeMixin:
                 placement.enter_context(engine.on_current_stream())
             for req in reqs:
                 start_restore_kv_cache(req, self.tree_cache)
-
-    def _start_host_restore_batch(self: Scheduler, reqs: List[Req]) -> None:
-        """Opt-in: submit one merged restore on the isolated H2D stream.
-
-        Native start_loading fences reused rows against the previous forward;
-        its rank-consistent ack gates admission and releases the host slots.
-        """
-        start_restore_kv_cache_batch(reqs, self.tree_cache)
 
     def _host_restores_ready(self: Scheduler) -> set[int]:
         """Ids of ordinary native restores finished on every participating rank.
