@@ -68,7 +68,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -123,7 +123,8 @@ from sglang.srt.runtime_context import (
     get_observability,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
-from sglang.srt.utils.common import ceil_align, get_device_module
+from sglang.srt.utils.common import ceil_align, get_device_module, is_npu
+from sglang.srt.utils.cuda_workqueues import enabled as workqueue_isolation_enabled
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -183,6 +184,11 @@ class _OngoingLoadBack(NamedTuple):
     node_id: NodeId
     lock_params: DecLockRefParams
     host_lock_params: DecLockRefParams
+
+
+class _PendingHostRestore(NamedTuple):
+    kv: ReqKvInfo
+    backup: RetractionBackup
 
 
 class _StoragePrefetchWait(msgspec.Struct):
@@ -319,6 +325,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # flight, each with its copy's finish event; their host slots are
         # returned once the copy has finished.
         self._pending_restore_backups: list[tuple[object, RetractionBackup]] = []
+        # Only the opt-in host-receive batch path shares one event across rows.
+        self._pending_host_restore_backups: dict[int, _PendingHostRestore] = {}
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
@@ -1478,14 +1486,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 }
                 <= self.host_pool_group.entry_map.keys()
             )
-        return isinstance(kv_cache, MHATokenToKVPool) and (
-            PoolName.KV in self.host_pool_group.entry_map
+        return PoolName.KV in self.host_pool_group.entry_map and (
+            isinstance(kv_cache, MHATokenToKVPool)
+            or (
+                workqueue_isolation_enabled()
+                and isinstance(kv_cache, MLATokenToKVPool)
+                and not is_npu()
+                and not getattr(kv_cache, "kpool_use_compress", False)
+            )
         )
 
     def validate_retraction_host_capacity(self) -> None:
         if not self.supports_retraction_backup():
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=host_pool requires "
+                "a compatible HiCache host pool stack."
+                if workqueue_isolation_enabled()
+                else "--disaggregation-decode-retraction-backup=host_pool requires "
                 "an MHA or hybrid-SWA HiCache host stack."
             )
 
@@ -1577,12 +1594,17 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_event.synchronize()
             self.discard_kv_cache_backup(backup)
         self._pending_restore_backups = []
+        for pending in tuple(self._pending_host_restore_backups.values()):
+            self._finish_host_restore(pending)
 
     def _finish_restore(self, kv: ReqKvInfo) -> None:
         """Wait for the copy restoring ``kv``'s row, if any, and return its host
         slots. Host capacity changes only here and when the cache is reset, at
         points every rank reaches alike, never when one rank's copy happens to
         finish."""
+        if pending := self._pending_host_restore_backups.get(id(kv)):
+            self._finish_host_restore(pending)
+            return
         event = kv.restore_done_event
         if event is None:
             return
@@ -1593,6 +1615,27 @@ class UnifiedRadixCache(BasePrefixCache):
                 del self._pending_restore_backups[i]
                 self.discard_kv_cache_backup(backup)
                 return
+
+    def _finish_host_restore(
+        self, pending: _PendingHostRestore, *, already_done: bool = False
+    ) -> None:
+        kv, backup = pending
+        if not already_done:
+            kv.restore_done_event.synchronize()
+        del self._pending_host_restore_backups[id(kv)]
+        kv.restore_done_event = None
+        self.discard_kv_cache_backup(backup)
+
+    def restore_waits_for_ack(self, req: Req) -> bool:
+        return id(req.kv) in self._pending_host_restore_backups
+
+    def _finish_restore_ack(self, finish_event: object) -> None:
+        # Several requests may share one merged copy. Release by row identity,
+        # including when an abort already returned another row in this batch.
+        if pending_restores := getattr(self, "_pending_host_restore_backups", None):
+            for pending in tuple(pending_restores.values()):
+                if pending.kv.restore_done_event is finish_event:
+                    self._finish_host_restore(pending, already_done=True)
 
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
@@ -1646,6 +1689,55 @@ class UnifiedRadixCache(BasePrefixCache):
         has completed. Page moves and frees wait for the copy as for a HiCache
         load; the host slots stay reserved until finish_restore_kv_cache, or
         freeing the row (free_kv_row), returns them after the copy."""
+        operation = self._prepare_restore_operation(req, backup)
+        load_host, load_device, load_pools = self.cache_controller._move_op_indices(
+            operation
+        )
+        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
+            self.cache_controller._l2_load_transfers(
+                load_host, load_device, load_pools
+            ),
+            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
+        )
+        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
+            (id(self), "restore"), completion.finish_event
+        )
+        req.kv.restore_done_event = completion.finish_event
+        self._pending_restore_backups.append((completion.finish_event, backup))
+
+    def start_restore_kv_cache_batch(self, reqs: list[Req]) -> None:
+        """Merge host-received rows into one native load/ack-ring submission."""
+        if not reqs:
+            return
+        assert self.has_free_load_back_slot()
+        operations = []
+        for req in reqs:
+            assert req.kv.restore_done_event is None
+            assert req.kv.retraction_backup is not None
+            operation = self._prepare_restore_operation(req, req.kv.retraction_backup)
+            # Request rows are owned by the restore ledger, not by tree nodes.
+            operation.node_ids = []
+            operations.append(operation)
+        cc = self.cache_controller
+        queue_offset = len(cc.load_queue)
+        cc.load_queue.extend(operations)
+        try:
+            cc.start_loading()
+        except Exception:
+            # Preparation can fail before start_loading clears the queue. Keep
+            # ownership on the requests and remove only this failed submission.
+            del cc.load_queue[queue_offset:]
+            raise
+        finish_event = cc.ack_load_queue[-1].finish_event
+        for req in reqs:
+            req.kv.restore_done_event = finish_event
+            self._pending_host_restore_backups[id(req.kv)] = _PendingHostRestore(
+                req.kv, req.kv.retraction_backup
+            )
+
+    def _prepare_restore_operation(
+        self, req: Req, backup: RetractionBackup
+    ) -> CacheOperation:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1674,26 +1766,12 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         assert resolved is not None or not restored_transfers
 
-        operation = CacheOperation(
+        return CacheOperation(
             backup.host_indices,
             device_indices,
             node_id=-1,
             pool_transfers=resolved,
         )
-        load_host, load_device, load_pools = self.cache_controller._move_op_indices(
-            operation
-        )
-        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
-            self.cache_controller._l2_load_transfers(
-                load_host, load_device, load_pools
-            ),
-            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
-        )
-        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
-            (id(self), "restore"), completion.finish_event
-        )
-        req.kv.restore_done_event = completion.finish_event
-        self._pending_restore_backups.append((completion.finish_event, backup))
 
     def finish_restore_kv_cache(self, req: Req) -> None:
         """Return the host slots of ``req``'s restore once its copy has finished."""
@@ -3644,6 +3722,7 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            self._finish_restore_ack(ack.finish_event)
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None

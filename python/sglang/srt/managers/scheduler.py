@@ -363,6 +363,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_confidential_compute, is_npu
+from sglang.srt.utils.cuda_workqueues import enabled as workqueue_isolation_enabled
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -616,7 +617,11 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or (
+            workqueue_isolation_enabled()
+            and get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_host_receive_threshold < 1
+        ):
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
                 cache_controller.load_fence_stream = (
@@ -5789,6 +5794,12 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+                    if workqueue_isolation_enabled() and (
+                        req.kv.retraction_backup is not None
+                        or req.kv.restore_done_event is not None
+                    ):
+                        # Unstarted or in-flight host KV is not safe to checkpoint.
+                        req.skip_radix_cache_insert = True
                     discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
@@ -5961,6 +5972,13 @@ class Scheduler(
                 self.waiting_queue = [
                     r for r in self.waiting_queue if not r.kv.holds_kv
                 ]
+                if (
+                    workqueue_isolation_enabled()
+                    and get_disagg().disaggregation_decode_host_receive_threshold < 1
+                ):
+                    # Rebootstrap recomputes KV; these requests have not restored it.
+                    for req in staged:
+                        discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 retract_reqs += staged
 
         self.last_batch = None
