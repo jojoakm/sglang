@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils.cuda_workqueues import enabled as workqueue_isolation_enabled
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -408,6 +409,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     item_size=self.indexer_page_stride_size,
+                    **({"block_quota": 8} if workqueue_isolation_enabled() else {}),
                 )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(

@@ -21,6 +21,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.disaggregation.common.utils import kvt_enabled, kvt_timeline
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -68,7 +69,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -121,9 +122,11 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
-from sglang.srt.utils.common import ceil_align, get_device_module
+from sglang.srt.utils.common import ceil_align, get_device_module, is_npu
+from sglang.srt.utils.cuda_workqueues import enabled as workqueue_isolation_enabled
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -183,6 +186,13 @@ class _OngoingLoadBack(NamedTuple):
     node_id: NodeId
     lock_params: DecLockRefParams
     host_lock_params: DecLockRefParams
+
+
+class _PendingHostRestore(NamedTuple):
+    kv: ReqKvInfo
+    finish_event: object
+    backup: RetractionBackup
+    timeline: Optional[tuple[int, str, int]] = None
 
 
 class _StoragePrefetchWait(msgspec.Struct):
@@ -319,6 +329,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # flight, each with its copy's finish event; their host slots are
         # returned once the copy has finished.
         self._pending_restore_backups: list[tuple[object, RetractionBackup]] = []
+        # Only the opt-in host-receive batch path shares one event across rows.
+        self._pending_host_restore_backups: dict[int, _PendingHostRestore] = {}
+        # A fresh, strongly held native finish event identifies each restore,
+        # even after an abort reuses the request row or the controller ring slot.
+        self._owner_restore_batches: dict[
+            int, tuple[object, tuple[RetractionBackup, ...]]
+        ] = {}
+        self._owner_restore_submitting: tuple[RetractionBackup, ...] = ()
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
@@ -613,6 +631,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        self._require_owner_reads_drained()
+        ctx = getattr(self, "owner_layer_context", None)
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
+            self.owner_layer_context = None
+            self.owner_layer_views = None
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -1478,14 +1502,23 @@ class UnifiedRadixCache(BasePrefixCache):
                 }
                 <= self.host_pool_group.entry_map.keys()
             )
-        return isinstance(kv_cache, MHATokenToKVPool) and (
-            PoolName.KV in self.host_pool_group.entry_map
+        return PoolName.KV in self.host_pool_group.entry_map and (
+            isinstance(kv_cache, MHATokenToKVPool)
+            or (
+                workqueue_isolation_enabled()
+                and isinstance(kv_cache, MLATokenToKVPool)
+                and not is_npu()
+                and not getattr(kv_cache, "kpool_use_compress", False)
+            )
         )
 
     def validate_retraction_host_capacity(self) -> None:
         if not self.supports_retraction_backup():
             raise ValueError(
                 "--disaggregation-decode-retraction-backup=host_pool requires "
+                "a compatible HiCache host pool stack."
+                if workqueue_isolation_enabled()
+                else "--disaggregation-decode-retraction-backup=host_pool requires "
                 "an MHA or hybrid-SWA HiCache host stack."
             )
 
@@ -1573,16 +1606,26 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _discard_restore_backups(self) -> None:
         """Wait for every pending restore copy and return its host slots."""
+        self._require_owner_reads_drained()
         for finish_event, backup in self._pending_restore_backups:
             finish_event.synchronize()
             self.discard_kv_cache_backup(backup)
         self._pending_restore_backups = []
+        for pending in self._pending_host_restore_backups.values():
+            pending.finish_event.synchronize()
+            self.discard_kv_cache_backup(pending.backup)
+            if pending.kv.restore_done_event is pending.finish_event:
+                pending.kv.restore_done_event = None
+        self._pending_host_restore_backups.clear()
 
     def _finish_restore(self, kv: ReqKvInfo) -> None:
         """Wait for the copy restoring ``kv``'s row, if any, and return its host
         slots. Host capacity changes only here and when the cache is reset, at
         points every rank reaches alike, never when one rank's copy happens to
         finish."""
+        if id(kv) in self._pending_host_restore_backups:
+            self._finish_host_restore(kv)
+            return
         event = kv.restore_done_event
         if event is None:
             return
@@ -1593,6 +1636,122 @@ class UnifiedRadixCache(BasePrefixCache):
                 del self._pending_restore_backups[i]
                 self.discard_kv_cache_backup(backup)
                 return
+
+    def _finish_host_restore(
+        self, kv: ReqKvInfo, *, already_done: bool = False
+    ) -> None:
+        pending = self._pending_host_restore_backups.get(id(kv))
+        if pending is None:
+            return
+        assert pending.kv is kv and pending.finish_event is kv.restore_done_event
+        if not already_done:
+            pending.finish_event.synchronize()
+        del self._pending_host_restore_backups[id(kv)]
+        kv.restore_done_event = None
+        if not pending.backup.owner_layer_receive:
+            self.discard_kv_cache_backup(pending.backup)
+
+    def restore_waits_for_ack(self, req: Req) -> bool:
+        return id(req.kv) in self._pending_host_restore_backups
+
+    def _finish_restore_ack(
+        self, finish_event: object
+    ) -> Optional[tuple[int, list[int]]]:
+        # Several requests may share one merged copy. Release by row identity,
+        # including when an abort already returned another row in this batch.
+        timeline_batch = None
+        for pending in tuple(self._pending_host_restore_backups.values()):
+            if pending.finish_event is finish_event:
+                self._finish_host_restore(pending.kv, already_done=True)
+                if pending.timeline is not None:
+                    room, rid, batch_id = pending.timeline
+                    if timeline_batch is None:
+                        timeline_batch = (batch_id, [])
+                    timeline_batch[1].append(room)
+                    kvt_timeline(
+                        "decode",
+                        "d_restore_ack",
+                        room=room,
+                        rid=rid,
+                        tp_rank=get_parallel().tp_rank,
+                        restore_batch=batch_id,
+                    )
+        if batches := getattr(self, "_owner_restore_batches", None):
+            owner = batches.pop(id(finish_event), None)
+            if owner is not None:
+                event, backups = owner
+                assert event is finish_event
+                probe = getattr(self, "_owner_layer_trace", None)
+                if probe is not None and probe[0] is event:
+                    from sglang.srt.mem_cache.owner_layer_receive import log_restore
+
+                    log_restore("all_rank_ack", *probe[1:])
+                    self._owner_layer_trace = None
+                    self.owner_layer_trace_room = -1
+                for i, backup in enumerate(backups):
+                    try:
+                        self.discard_kv_cache_backup(backup)
+                    except Exception:
+                        # A pool may have returned only some of the sidecars.
+                        # Quarantine the remaining ownership until group teardown.
+                        self._owner_restore_submitting += backups[i:]
+                        raise
+        return timeline_batch
+
+    def _begin_owner_layer_restore(self, reqs):
+        if self._owner_restore_submitting:
+            raise RuntimeError("Previous shared restore has no certified ack")
+        shared = tuple(
+            req.kv.retraction_backup for req in reqs if req.kv.retraction_backup.owner_layer_receive
+        )
+        self._owner_restore_submitting = shared
+        return shared
+
+    def _register_owner_layer_restore(self, finish_event, shared):
+        if self._owner_restore_submitting is not shared or id(finish_event) in self._owner_restore_batches:
+            raise RuntimeError("Shared restore has no unique native completion event")
+        self._owner_restore_batches[id(finish_event)] = (finish_event, shared)
+
+    def _commit_owner_layer_restore(self, shared):
+        if self._owner_restore_submitting is not shared:
+            raise RuntimeError("Unexpected shared restore submission")
+        self._owner_restore_submitting = ()
+
+    def _cancel_unlaunched_owner_layer_restore(self, shared):
+        """Only after all ranks reject this exact plan before any native read."""
+        if any(batch is shared for _, batch in self._owner_restore_batches.values()):
+            raise RuntimeError("A submitted shared read must receive its TP ack")
+        self._commit_owner_layer_restore(shared)
+
+    def owner_layer_has_pending_reads(self):
+        return bool(
+            getattr(self, "_owner_restore_batches", None)
+            or getattr(self, "_owner_restore_submitting", None)
+        )
+
+    def _require_owner_reads_drained(self):
+        if self.owner_layer_has_pending_reads():
+            raise RuntimeError("Shared host sources await a certified TP load ack")
+
+    def drain_owner_layer_restores(self, *, quiesce_writers=None):
+        """Whole-TP maintenance only, with new admissions stopped on every rank."""
+        error = None
+        try:
+            if quiesce_writers is not None:
+                quiesce_writers()
+            for ack in self.cache_controller.ack_load_queue:
+                ack.finish_event.synchronize()
+        except Exception as exc:
+            error = exc
+        failed = torch.tensor(
+            [int(bool(self._owner_restore_submitting) or error is not None)],
+            dtype=torch.int64, device="cpu",
+        )
+        self._all_reduce(failed, torch.distributed.ReduceOp.MAX)
+        if failed.item():
+            raise RuntimeError("Uncertified shared transfer; quarantine arena until group teardown") from error
+        self.loading_check()
+        self._require_owner_reads_drained()
 
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
@@ -1646,6 +1805,133 @@ class UnifiedRadixCache(BasePrefixCache):
         has completed. Page moves and frees wait for the copy as for a HiCache
         load; the host slots stay reserved until finish_restore_kv_cache, or
         freeing the row (free_kv_row), returns them after the copy."""
+        if backup.owner_layer_receive:
+            raise RuntimeError("Shared owner reads require the rank-agreed batched restore")
+        operation = self._prepare_restore_operation(req, backup)
+        load_host, load_device, load_pools = self.cache_controller._move_op_indices(
+            operation
+        )
+        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
+            self.cache_controller._l2_load_transfers(
+                load_host, load_device, load_pools
+            ),
+            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
+        )
+        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
+            (id(self), "restore"), completion.finish_event
+        )
+        req.kv.restore_done_event = completion.finish_event
+        self._pending_restore_backups.append((completion.finish_event, backup))
+        if req.bootstrap_room is not None and kvt_enabled(req.bootstrap_room):
+            kvt_timeline(
+                "decode",
+                "d_restore_submitted",
+                room=req.bootstrap_room,
+                rid=req.rid,
+                mode="unbatched",
+                host_tokens=len(backup.host_indices),
+            )
+
+    def start_restore_kv_cache_batch(self, reqs: list[Req]) -> None:
+        """Merge host-received rows into one native load/ack-ring submission."""
+        if not reqs:
+            return
+        assert self.has_free_load_back_slot()
+        operations = []
+        owner_requests = {}
+        for req in reqs:
+            assert req.kv.restore_done_event is None
+            assert req.kv.retraction_backup is not None
+            operation = self._prepare_restore_operation(req, req.kv.retraction_backup)
+            # Request rows are owned by the restore ledger, not by tree nodes.
+            operation.node_ids = []
+            operations.append(operation)
+            if req.kv.retraction_backup.owner_layer_receive:
+                owner_requests[operation] = req
+        cc = self.cache_controller
+        shared = ()
+        if owner_requests:
+            from sglang.srt.mem_cache.owner_layer_receive import (
+                OwnerPlanRejectedBeforeRead,
+                prepare_owner_read_plan,
+            )
+
+            shared = self._begin_owner_layer_restore(reqs)
+            try:
+                owner_read_plan = prepare_owner_read_plan(
+                    self.owner_layer_views,
+                    self.owner_layer_group,
+                    [*cc.load_queue, *operations],
+                    owner_requests,
+                )
+            except OwnerPlanRejectedBeforeRead:
+                self._cancel_unlaunched_owner_layer_restore(shared)
+                raise
+        cc.load_queue.extend(operations)
+        try:
+            if owner_requests:
+                cc.start_loading(owner_read_plan=owner_read_plan)
+            else:
+                cc.start_loading()
+        except Exception:
+            # Preparation can fail before start_loading clears the queue. Keep
+            # ownership on the requests and remove only this failed submission.
+            operation_ids = {id(operation) for operation in operations}
+            cc.load_queue[:] = [
+                operation
+                for operation in cc.load_queue
+                if id(operation) not in operation_ids
+            ]
+            raise
+        finish_event = cc.ack_load_queue[-1].finish_event
+        if shared:
+            self._register_owner_layer_restore(finish_event, shared)
+            trace_room = getattr(self, "owner_layer_trace_room", -1)
+            if trace_room >= 0:
+                for operation, req in owner_requests.items():
+                    if req.bootstrap_room == trace_room:
+                        from sglang.srt.mem_cache.owner_layer_receive import log_restore
+
+                        fields = (trace_room, req.rid, get_parallel().tp_rank, len(operation.host_indices))
+                        self._owner_layer_trace = (finish_event, *fields)
+                        log_restore("native_submitted", *fields)
+        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
+            (id(self), "restore"), finish_event
+        )
+        timeline = kvt_enabled()
+        batch_id = None
+        for req in reqs:
+            timeline_fields = None
+            if (
+                timeline
+                and req.bootstrap_room is not None
+                and kvt_enabled(req.bootstrap_room)
+            ):
+                if batch_id is None:
+                    batch_id = time.monotonic_ns()
+                timeline_fields = (req.bootstrap_room, req.rid, batch_id)
+            req.kv.restore_done_event = finish_event
+            self._pending_host_restore_backups[id(req.kv)] = _PendingHostRestore(
+                req.kv, finish_event, req.kv.retraction_backup, timeline_fields
+            )
+            if timeline_fields is not None:
+                kvt_timeline(
+                    "decode",
+                    "d_restore_submitted",
+                    room=req.bootstrap_room,
+                    rid=req.rid,
+                    mode="batched",
+                    tp_rank=get_parallel().tp_rank,
+                    restore_batch=batch_id,
+                    batch_size=len(reqs),
+                    host_tokens=len(req.kv.retraction_backup.host_indices),
+                )
+        if shared:
+            self._commit_owner_layer_restore(shared)
+
+    def _prepare_restore_operation(
+        self, req: Req, backup: RetractionBackup
+    ) -> CacheOperation:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1674,32 +1960,27 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         assert resolved is not None or not restored_transfers
 
-        operation = CacheOperation(
+        return CacheOperation(
             backup.host_indices,
             device_indices,
             node_id=-1,
             pool_transfers=resolved,
         )
-        load_host, load_device, load_pools = self.cache_controller._move_op_indices(
-            operation
-        )
-        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
-            self.cache_controller._l2_load_transfers(
-                load_host, load_device, load_pools
-            ),
-            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
-        )
-        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
-            (id(self), "restore"), completion.finish_event
-        )
-        req.kv.restore_done_event = completion.finish_event
-        self._pending_restore_backups.append((completion.finish_event, backup))
 
     def finish_restore_kv_cache(self, req: Req) -> None:
         """Return the host slots of ``req``'s restore once its copy has finished."""
         self._finish_restore(req.kv)
 
     def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
+        if backup.owner_layer_receive and (
+            any(other is backup for other in self._owner_restore_submitting)
+            or any(
+                other is backup
+                for _, batch in self._owner_restore_batches.values()
+                for other in batch
+            )
+        ):
+            raise RuntimeError("Attempted to recycle a shared host source before its TP ack")
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 
@@ -3644,6 +3925,7 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            timeline_batch = self._finish_restore_ack(ack.finish_event)
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
@@ -3656,6 +3938,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
 
+            duration_ms = None
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
                     if num_tokens > 0:
@@ -3669,6 +3952,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.metrics_collector.observe_load_back_duration(
                         duration_ms / 1000.0
                     )
+            if timeline_batch is not None:
+                batch_id, sampled_rooms = timeline_batch
+                if duration_ms is None and ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                kvt_timeline(
+                    "decode",
+                    "d_restore_batch_ack",
+                    room=sampled_rooms[0],
+                    sampled_rooms=sampled_rooms,
+                    tp_rank=get_parallel().tp_rank,
+                    restore_batch=batch_id,
+                    bytes=ack.num_bytes,
+                    cuda_duration_ms=duration_ms,
+                )
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----

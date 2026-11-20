@@ -42,6 +42,8 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+    # Other TP readers can still be using these host pages after a local abort.
+    owner_layer_receive: bool = False
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -391,6 +393,15 @@ def start_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     assert req.kv.retraction_backup is not None
     unified_cache.start_restore_kv_cache(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
+
+
+def start_restore_kv_cache_batch(reqs: list[Req], tree_cache: BasePrefixCache) -> None:
+    """Submit candidate host-received rows together; the ack releases their slots."""
+    reqs = [req for req in reqs if req.seqlen > 1]
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    unified_cache.start_restore_kv_cache_batch(reqs)
+    for req in reqs:
+        req.kv.retraction_backup = None
 
 
 def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:

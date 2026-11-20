@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
 import threading
 import time
+from bisect import bisect_right
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -15,7 +17,12 @@ import numpy.typing as npt
 import torch
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -42,6 +49,12 @@ from sglang.srt.disaggregation.common.utils import (
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
+    kvt_chunk_metadata,
+    kvt_current_context,
+    kvt_enabled,
+    kvt_reset_context,
+    kvt_set_context,
+    kvt_timeline,
     pack_int_lists,
     run_on_device,
     unpack_int_lists,
@@ -82,9 +95,57 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import is_cuda
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+
+def _transfer_submitter(executor):
+    timeline = kvt_current_context()
+    if not timeline:
+        return executor.submit
+
+    def run(fn, *args):
+        # Propagate only the timeline, leaving other ContextVars unchanged.
+        token = kvt_set_context(timeline)
+        try:
+            return fn(*args)
+        finally:
+            kvt_reset_context(token)
+
+    def submit(fn, *args):
+        return executor.submit(run, fn, *args)
+
+    return submit
+
+
+def _timed_batch_transfer(engine, session_id, src_addrs, dst_addrs, lengths, timeline):
+    fields = dict(
+        timeline, session=session_id, blocks=len(lengths), bytes=int(sum(lengths))
+    )
+    kvt_timeline("engine", "engine_begin", **fields)
+    started = time.perf_counter()
+    try:
+        ret = engine.batch_transfer_sync(session_id, src_addrs, dst_addrs, lengths)
+    except Exception as error:
+        kvt_timeline(
+            "engine",
+            "engine_end",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            error=type(error).__name__,
+            **fields,
+        )
+        raise
+    kvt_timeline(
+        "engine",
+        "engine_end",
+        duration_ms=(time.perf_counter() - started) * 1000,
+        ret=int(ret),
+        **fields,
+    )
+    return ret
+
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -115,6 +176,8 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    destination: KVTransferDestination = KVTransferDestination.DEVICE
+    shared_main_v1: bool = dataclasses.field(default=False, kw_only=True)
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -137,6 +200,12 @@ class TransferInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
+            shared_main_v1=(
+                not is_dummy
+                and len(msg) > 11
+                and msg[10] == b"host"
+                and msg[11] == OWNER_MLA_V1
+            ),
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
@@ -147,6 +216,11 @@ class TransferInfo:
                 np.frombuffer(msg[9], dtype=np.int32)
                 if len(msg) > 9 and msg[9] != b""
                 else None
+            ),
+            destination=(
+                KVTransferDestination(msg[10].decode("ascii"))
+                if len(msg) > 10
+                else KVTransferDestination.DEVICE
             ),
         )
 
@@ -176,11 +250,12 @@ class KVArgsRegisterInfo:
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    host_destination: Optional[KVArgsRegisterInfo] = None
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
-        return cls(
+        info = cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -229,6 +304,35 @@ class KVArgsRegisterInfo:
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
+        if len(msg) > 20 and msg[20]:
+            # Pool exporters verify identical host/device page strides. The
+            # auxiliary completion buffers stay on the device.
+            info.host_destination = dataclasses.replace(
+                info,
+                dst_kv_ptrs=list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20])),
+                dst_state_data_ptrs=unpack_int_lists(msg[21], "Q"),
+                staging_base_ptr=0,
+                staging_total_size=0,
+                staging=None,
+            )
+        return info
+
+    def for_destination(self, destination: KVTransferDestination) -> KVArgsRegisterInfo:
+        if destination == KVTransferDestination.DEVICE:
+            return self
+        if self.host_destination is None:
+            raise ValueError("Decode peer did not register a host KV destination")
+        # DCP relayout fields are derived after parsing the registration. Keep
+        # those current fields when selecting the alternative host pointers.
+        return dataclasses.replace(
+            self,
+            dst_kv_ptrs=self.host_destination.dst_kv_ptrs,
+            dst_state_data_ptrs=self.host_destination.dst_state_data_ptrs,
+            staging_base_ptr=0,
+            staging_total_size=0,
+            staging=None,
+            host_destination=None,
+        )
 
 
 def _uses_flat_entry_layout(
@@ -252,6 +356,95 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
+def _owned_mla_ptrs(manager, rank, dst_ptrs, dst_tp_size, dst_item_len, dst_layer_ids):
+    """Identify whole registered target layers by their source pointer before native batching."""
+    kv = manager.kv_args
+    if (
+        rank != manager.attn_tp_rank
+        or rank not in range(4)
+        or not manager.is_mla_backend
+        or (manager.pp_size, manager.attn_tp_size, dst_tp_size) != (1, 4, 4)
+        or kv.page_size != 64
+        or kv.num_draft_entries != 1
+        or kv.prefill_start_layer != 0
+        or kv.mla_compression_ratios is not None
+        or kv.kv_layer_ids
+        or dst_layer_ids
+    ):
+        raise ValueError("Expected the registered plain TP4 MLA layout")
+    # PP1 GLM records target layers in order, followed by one packed draft entry.
+    # Source and destination have independent virtual addresses and physical page IDs.
+    valid_ptrs = all(
+        len(ptrs) == 79 and len(set(ptrs)) == 79 and min(ptrs) > 0
+        for ptrs in (kv.kv_data_ptrs, dst_ptrs)
+    )
+    if (
+        not valid_ptrs
+        or list(kv.kv_item_lens) != [64 * 576] * 79
+        or dst_item_len != 64 * 576
+    ):
+        raise ValueError(
+            "Expected 78 target MLA buffers and one appended draft buffer on each peer"
+        )
+    return set(kv.kv_data_ptrs[rank:78:4]) | {kv.kv_data_ptrs[-1]}
+
+
+OWNER_MLA_V1 = b"sglang-q8-owner-mla78-tp4-v1"
+
+
+def _owner_for_peer(manager, req, registration):
+    if not getattr(manager, "enable_owner_mla_send", False) or not req.shared_main_v1:
+        return None
+    if (
+        req.is_dummy
+        or req.destination != KVTransferDestination.HOST
+        or manager.attn_tp_rank != registration.dst_tp_rank
+        or registration.dst_attn_tp_size != 4
+    ):
+        raise ValueError("Invalid owner-layer peer or lane")
+    return manager.attn_tp_rank
+
+
+def _owner_trace_fields(manager, chunk):
+    if getattr(manager, "owner_mla_trace_room", -1) != chunk.room:
+        return None
+    return dict(
+        room=chunk.room,
+        rank=manager.attn_tp_rank,
+        pid=os.getpid(),
+        last=chunk.is_last_chunk,
+        start_page=chunk.index_slice.start,
+        stop_page=chunk.index_slice.stop,
+        num_kv_tokens=chunk.num_kv_tokens,
+    )
+
+
+def _owner_native_record(kv, blocks):
+    """Decode submitted source addresses against the original per-layer registrations."""
+    spans = sorted(
+        (int(p), int(n), i)
+        for i, (p, n) in enumerate(zip(kv.kv_data_ptrs, kv.kv_data_lens))
+    )
+    bases = [p for p, _, _ in spans]
+    unknown = 0
+    layer_bytes = defaultdict(int)
+    for address, _, count in blocks:
+        j = bisect_right(bases, address) - 1
+        if j < 0 or address + count > spans[j][0] + spans[j][1]:
+            unknown += count
+        else:
+            layer_bytes[spans[j][2]] += count
+    target = {i: n for i, n in sorted(layer_bytes.items()) if i < 78}
+    return dict(
+        main_layers=list(target),
+        main_bytes=sum(target.values()),
+        draft_bytes=layer_bytes.get(78, 0),
+        native_bytes=sum(n for _, _, n in blocks),
+        native_descriptors=len(blocks),
+        unclassified_bytes=unknown,
+    )
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
@@ -260,6 +453,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+
+    @property
+    def supports_host_transfer(self) -> bool:
+        return is_cuda() and self.enable_deferred_decode_kv_release
 
     def __init__(
         self,
@@ -278,6 +475,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_owner_mla_send = envs.SGLANG_MOONCAKE_OWNER_MLA_SEND.get()
+        self.owner_mla_trace_room = envs.SGLANG_MOONCAKE_OWNER_MLA_TRACE_ROOM.get()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -428,9 +627,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
             add(ptrs, lens)
+        if self.supports_host_destination:
+            add(self.kv_args.host_kv_data_ptrs, self.kv_args.host_kv_data_lens)
+            for ptrs, lens in zip(
+                self.kv_args.host_state_data_ptrs or [],
+                self.kv_args.host_state_data_lens or [],
+            ):
+                add(ptrs, lens)
         return regions
 
     def register_buffer_to_engine(self):
+        self.supports_host_destination = bool(self.kv_args.host_kv_data_ptrs)
+        if self.supports_host_destination and not self.supports_host_transfer:
+            raise ValueError(
+                "Mooncake host receive requires NVIDIA CUDA and deferred KV release"
+            )
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
@@ -635,7 +846,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # block other rooms on this single worker thread.
             with self._staging_ctx.watermark_cv:
                 self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+            timeline = kvt_current_context()
+            if timeline:
+                ts = time.time()
+                monotonic_ns = time.monotonic_ns()
+                kv_chunk.enqueued_at = time.perf_counter()
             queue.put(kv_chunk)
+            if timeline:
+                kvt_timeline(
+                    "worker",
+                    "requeue",
+                    ts=ts,
+                    monotonic_ns=monotonic_ns,
+                    queue_depth=queue.qsize(),
+                    **timeline,
+                )
             return (-1, True)
 
         ret = staging_strategy.transfer(
@@ -670,6 +895,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return
 
         room_infos = self.transfer_infos.get(room, {})
+        transfer_infos = self.transfer_infos
+        if any(
+            info.destination == KVTransferDestination.HOST
+            for info in room_infos.values()
+        ):
+            room_infos = {
+                peer: info
+                for peer, info in room_infos.items()
+                if info.destination == KVTransferDestination.DEVICE
+            }
+            transfer_infos = {room: room_infos}
         needs_staging = any(
             not tinfo.is_dummy
             and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
@@ -686,7 +922,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         prefetch_staging_reqs(
             room,
-            self.transfer_infos,
+            transfer_infos,
             self.kv_buffer_tensors,
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
@@ -823,11 +1059,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def _transfer_data(self, mooncake_session_id, transfer_blocks, timeline=None):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        if timeline is None:
+            timeline = kvt_current_context()
+        if timeline and kvt_enabled(timeline.get("room")):
+            return _timed_batch_transfer(
+                self.engine,
+                mooncake_session_id,
+                list(src_addrs),
+                list(dst_addrs),
+                list(lengths),
+                timeline,
+            )
         return self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
@@ -1042,6 +1289,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_ptrs: Optional[set[int]] = None,
         dst_item_lens: list[int] | None = None,
         bootstrap_room: Optional[int] = None,
+        owned_ptrs: Optional[set[int]] = None,
+        owner_trace: Optional[dict] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -1177,6 +1426,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        if owned_ptrs is not None:
+            layers_params = [entry for entry in layers_params if entry[0] in owned_ptrs]
+
+        submit_blocks = self._transfer_data
+        if owned_ptrs is not None and owner_trace is not None:
+
+            def submit_blocks(session, blocks):
+                rc = self._transfer_data(session, blocks)
+                if blocks:
+                    record = _owner_native_record(self.kv_args, blocks)
+                    logger.info(
+                        "PD_OWNER_MLA_NATIVE %s",
+                        json.dumps(dict(**owner_trace, **record, rc=rc)),
+                    )
+                return rc
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -1203,21 +1467,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return submit_blocks(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return submit_blocks(mooncake_session_id, transfer_blocks)
 
         if (
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
+            submit = _transfer_submitter(executor)
             futures = [
-                executor.submit(
+                submit(
                     process_layer,
                     src_ptr,
                     dst_ptr,
@@ -1258,7 +1523,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_addr = dst_ptr + int(decode_index[0]) * item_len
                         length = item_len * len(prefill_index)
                         transfer_blocks.append((src_addr, dst_addr, length))
-                return self._transfer_data(mooncake_session_id, transfer_blocks)
+                return submit_blocks(mooncake_session_id, transfer_blocks)
 
             for start in range(
                 0,
@@ -1363,6 +1628,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        *,
+        owner_rank: Optional[int] = None,
+        owner_trace: Optional[dict] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1401,6 +1669,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            owner_trace=owner_trace,
+            owned_ptrs=(
+                _owned_mla_ptrs(
+                    self,
+                    owner_rank,
+                    dst_kv_ptrs,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                    dst_layer_ids,
+                )
+                if owner_rank is not None
+                else None
+            ),
         )
 
     def send_kvcache_dcp(
@@ -1631,12 +1912,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         if self.enable_custom_mem_pool:
+            submit = _transfer_submitter(executor)
             futures = [
-                executor.submit(process_layer, *layer_params)
+                submit(process_layer, *layer_params)
                 for layer_params in layers_params
             ]
             futures.extend(
-                executor.submit(process_sliced_draft, [params])
+                submit(process_sliced_draft, [params])
                 for params in sliced_draft_params
             )
             try:
@@ -1775,12 +2057,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
+            timeline = kvt_current_context()
+            if timeline:
+                return _timed_batch_transfer(
+                    self.engine,
+                    mooncake_session_id,
+                    src_addr_list,
+                    dst_addr_list,
+                    length_list,
+                    timeline,
+                )
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
+        submit = _transfer_submitter(executor)
         futures = [
-            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
+            submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
             for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
         ]
 
@@ -2468,8 +2761,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "Using SWA state head-slice transfer for different attention TP sizes: "
             f"prefill={self.attn_tp_size}, decode={dst_attn_tp_size}."
         )
+        submit = _transfer_submitter(executor)
         futures = [
-            executor.submit(
+            submit(
                 self._transfer_data,
                 req.mooncake_session_id,
                 list(
@@ -2511,6 +2805,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
+            timeline_token = None
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -2518,6 +2813,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                timeline_on = kvt_enabled(kv_chunk.room)
+                if timeline_on:
+                    tp_rank = getattr(self, "attn_tp_rank", None)
+                    kvt_timeline(
+                        "worker",
+                        "dequeue",
+                        queue_wait_ms=(
+                            (time.perf_counter() - kv_chunk.enqueued_at) * 1000
+                            if kv_chunk.enqueued_at > 0
+                            else None
+                        ),
+                        queue_depth=queue.qsize(),
+                        tp_rank=tp_rank,
+                        **kvt_chunk_metadata(kv_chunk, worker_index),
+                    )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2538,16 +2848,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the worker, not the scheduler, before reading source KV.
                 # A room that already failed skips the wait; the status check
                 # below then drops the chunk, including on an abort during it.
+                gpu_wait_start = None
                 if kv_chunk.wait_event is not None:
                     if (
                         kv_chunk.room in self.request_status
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
+                        if timeline_on:
+                            gpu_wait_start = time.perf_counter()
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
+                    if timeline_on and gpu_wait_start is None:
+                        gpu_wait_start = time.perf_counter()
                     kv_chunk.indices_event.synchronize()
                     kv_chunk.indices_event = None
+                if gpu_wait_start is not None:
+                    kvt_timeline(
+                        "worker",
+                        "gpu_wait_end",
+                        duration_ms=(time.perf_counter() - gpu_wait_start) * 1000,
+                        tp_rank=tp_rank,
+                        **kvt_chunk_metadata(kv_chunk, worker_index),
+                    )
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
@@ -2587,6 +2910,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
                 for req in reqs_to_be_processed:
+                    if timeline_on:
+                        context = kvt_chunk_metadata(
+                            kv_chunk, worker_index, req.mooncake_session_id
+                        )
+                        context["destination"] = req.destination.value
+                        context["tp_rank"] = tp_rank
+                        timeline_token = kvt_set_context(context)
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -2617,6 +2947,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        if req.destination == KVTransferDestination.HOST:
+                            target_rank_registration_info = (
+                                target_rank_registration_info.for_destination(
+                                    req.destination
+                                )
+                            )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -2712,6 +3048,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                owner_trace=_owner_trace_fields(self, kv_chunk),
+                                owner_rank=_owner_for_peer(
+                                    self, req, target_rank_registration_info
+                                ),
                             )
                         elif (
                             self.enable_staging
@@ -2828,6 +3168,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         else f"Failed to send aux data of {req.room}"
                                     ),
                                 )
+                                if timeline_on:
+                                    kvt_timeline(
+                                        "worker",
+                                        "conclude_transfer",
+                                        status=int(status),
+                                        **context,
+                                    )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -2840,6 +3187,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
+                    if timeline_token is not None:
+                        kvt_reset_context(timeline_token)
+                        timeline_token = None
+
+                # A failed or deferred destination can break out before the
+                # normal per-destination cleanup above.
+                if timeline_token is not None:
+                    kvt_reset_context(timeline_token)
+                    timeline_token = None
 
                 if self.enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
@@ -2891,6 +3247,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if timeline_token is not None:
+                    kvt_reset_context(timeline_token)
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3129,19 +3488,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-                indices_event=indices_event,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            wait_event=wait_event,
+            indices_event=indices_event,
+        )
+        queue = self.transfer_queues[shard_idx]
+        if not kvt_enabled(bootstrap_room):
+            queue.put(chunk)
+            return
+
+        # The consumer can run immediately after put. Snapshot enqueue time
+        # first so timeline reconstruction sees the actual queue ordering.
+        metadata = kvt_chunk_metadata(chunk, shard_idx, "|".join(dst_infos))
+        ts = time.time()
+        monotonic_ns = time.monotonic_ns()
+        chunk.enqueued_at = time.perf_counter()
+        queue.put(chunk)
+        kvt_timeline(
+            "prefill",
+            "enqueue",
+            ts=ts,
+            monotonic_ns=monotonic_ns,
+            num_pages=len(kv_indices),
+            num_kv_tokens=num_kv_tokens,
+            queue_depth=queue.qsize(),
+            tp_rank=getattr(self, "attn_tp_rank", None),
+            **metadata,
         )
 
     def get_session_id(self):
@@ -3285,7 +3665,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
-        ]
+        ] + (
+            [
+                struct.pack(
+                    f"{len(self.kv_args.host_kv_data_ptrs)}Q",
+                    *self.kv_args.host_kv_data_ptrs,
+                ),
+                pack_int_lists(self.kv_args.host_state_data_ptrs or [], "Q"),
+            ]
+            if self.supports_host_destination
+            else []
+        )
 
     def build_receiver_metadata_message(
         self,
@@ -3298,6 +3688,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ) -> List[bytes]:
         return [
             str(bootstrap_room).encode("ascii"),
@@ -3314,7 +3705,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             np.asarray(device_kv_indices, dtype=np.int32).tobytes()
             if not is_dummy and device_kv_indices is not None
             else b"",
-        ]
+        ] + (
+            [destination.value.encode("ascii")]
+            if destination != KVTransferDestination.DEVICE
+            else []
+        ) + (
+            # The receiver has bound all four read-only peer views. Writes still go to
+            # the original rank-local buffers, including those sent by legacy senders.
+            [b"sglang-q8-owner-mla78-tp4-v1"]
+            if destination == KVTransferDestination.HOST
+            and not is_dummy
+            and getattr(self, "owner_layer_receive_ready", False)
+            else []
+        )
 
 
 class MooncakeKVSender(CommonKVSender):
@@ -3358,7 +3761,29 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    pass
+    @property
+    def supports_host_destination(self) -> bool:
+        return self.kv_mgr.supports_host_destination
+
+    def is_abort_release_safe(self) -> bool:
+        return self.kv_mgr.is_abort_release_safe(
+            self.bootstrap_room, len(self.bootstrap_infos)
+        )
+
+    def _register_kv_args(self) -> bool:
+        if self.bootstrap_infos is None:
+            return False
+        if self.supports_host_destination and any(
+            not info.get("supports_host_transfer", False)
+            for info in self.bootstrap_infos
+        ):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room, "Prefill peer does not support host transfer"
+            )
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return False
+        return super()._register_kv_args()
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

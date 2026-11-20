@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
@@ -218,6 +219,71 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+class TestDecodeReadyFirst(CustomTestCase):
+    def test_ready_request_does_not_lose_its_slot_to_a_restore(self):
+        """A ready request must not be blocked by an earlier pending restore."""
+        for restore_slot_available in (True, False):
+            with self.subTest(restore_slot_available=restore_slot_available):
+
+                def make_req(restoring):
+                    req = MagicMock()
+                    req.kv.retraction_backup = object() if restoring else None
+                    req.kv.restore_done_event = None
+                    req.kv.kv_committed_len = None
+                    return req
+
+                restoring = make_req(restoring=True)
+                ready = make_req(restoring=False)
+                scheduler = SimpleNamespace(
+                    grammar_manager=SimpleNamespace(
+                        has_waiting_grammars=lambda: False
+                    ),
+                    waiting_queue=[restoring, ready],
+                    enable_priority_scheduling=False,
+                    req_to_token_pool=SimpleNamespace(size=1),
+                    max_running_requests=1,
+                    token_to_kv_pool_allocator=MagicMock(),
+                    tree_cache=MagicMock(),
+                    model_config=MagicMock(),
+                    enable_overlap=False,
+                    spec_algorithm=None,
+                    _host_restores_ready=MagicMock(return_value=set()),
+                    _start_host_restore_batch=MagicMock(),
+                )
+                scheduler.tree_cache.has_free_load_back_slot.return_value = (
+                    restore_slot_available
+                )
+                new_batch = MagicMock()
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.decode.get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_decode_host_receive_threshold=0,
+                            disaggregation_decode_enable_radix_cache=False,
+                        ),
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.decode.workqueue_isolation_enabled",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                        return_value=new_batch,
+                    ) as init_new,
+                ):
+                    result = SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(
+                        scheduler, SimpleNamespace(batch_size=lambda: 0)
+                    )
+
+                self.assertIs(result, new_batch)
+                self.assertEqual(init_new.call_args.args[0], [ready])
+                self.assertEqual(scheduler.waiting_queue, [restoring])
+                self.assertEqual(
+                    scheduler._start_host_restore_batch.call_count,
+                    int(restore_slot_available),
+                )
 
 
 if __name__ == "__main__":

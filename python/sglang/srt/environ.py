@@ -756,6 +756,8 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    SGLANG_DEBUG_KVT_TIMELINE = EnvBool(False)
+    SGLANG_DEBUG_KVT_TIMELINE_SAMPLE_EVERY = EnvInt(1)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)
     # Retained only to reject the removed setting during startup.
@@ -824,6 +826,8 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Receive one host copy of each replicated main MLA layer across same-node D ranks.
+    SGLANG_DISAGG_OWNER_LAYER_RECEIVE = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -870,6 +874,10 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # Enable layer-owner sends only for peers advertising the per-room TP4 MLA layout.
+    SGLANG_MOONCAKE_OWNER_MLA_SEND = EnvBool(False)
+    # Optional native descriptor evidence for exactly one private bootstrap room.
+    SGLANG_MOONCAKE_OWNER_MLA_TRACE_ROOM = EnvInt(-1)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)

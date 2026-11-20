@@ -15,6 +15,7 @@ from typing import (
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.common.utils import kvt_enabled, kvt_timeline
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
@@ -119,8 +120,16 @@ class SchedulerBatchResultProcessor:
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
+        timeline = kvt_enabled()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
+            if timeline:
+                kvt_timeline(
+                    "decode",
+                    "d_prebuilt_result",
+                    room=req.bootstrap_room,
+                    rid=req.rid,
+                )
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
@@ -1003,6 +1012,7 @@ class SchedulerBatchResultProcessor:
         if batch.spec_algorithm.is_none() and logits_output is not None:
             newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
 
+        timeline = self.disaggregation_mode == DisaggregationMode.DECODE and kvt_enabled()
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -1031,6 +1041,14 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
+            if timeline and req.time_stats.last_decode_finish_time == 0.0:
+                kvt_timeline(
+                    "decode",
+                    "d_first_decode_result",
+                    room=req.bootstrap_room,
+                    rid=req.rid,
+                    batch_size=batch_size,
+                )
             req.time_stats.set_last_decode_finish_time()
             sampling_mask_finish_reason = None
             if req.return_sampling_mask:

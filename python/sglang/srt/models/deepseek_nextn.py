@@ -110,8 +110,10 @@ class DeepseekModelNextN(nn.Module):
                 self.rot_weight = load_file(rot_weight_path)
                 self.rot_weight = self.rot_weight["rot.weight"].npu()
 
+        from sglang.srt.utils import cuda_workqueues
+
         self.alt_stream = (
-            torch.cuda.Stream()
+            cuda_workqueues.new_stream(torch.cuda, "model")
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
