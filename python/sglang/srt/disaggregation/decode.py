@@ -3534,22 +3534,31 @@ class SchedulerDisaggregationDecodeMixin:
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
+        num_ready_candidates = 0
 
         for i, req in enumerate(self.waiting_queue):
-            # The opt-in batch path reserves its candidate prefix while copies
-            # are pending. Otherwise retain the native ready-request admission.
-            candidate = (
-                i < num_not_used_batch
-                if batched_restore
-                else len(can_run_list) < num_not_used_batch
-                and (
+            pending_restore = batched_restore and (
+                req.kv.retraction_backup is not None
+                or (
+                    req.kv.restore_done_event is not None
+                    and id(req) not in restores_ready
+                )
+            )
+            if batched_restore:
+                # Restores keep their candidate prefix without consuming ready slots.
+                candidate = (pending_restore and i < num_not_used_batch) or (
+                    not pending_restore and num_ready_candidates < num_not_used_batch
+                )
+            else:
+                candidate = len(can_run_list) < num_not_used_batch and (
                     not host_restore
                     or req.kv.restore_done_event is None
                     or id(req) in restores_ready
                 )
-            )
             if candidate:
                 can_run_list.append(req)
+                if batched_restore and not pending_restore:
+                    num_ready_candidates += 1
                 if req.kv.restore_done_event is not None and (
                     not batched_restore or id(req) in restores_ready
                 ):
