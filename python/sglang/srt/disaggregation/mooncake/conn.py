@@ -3390,6 +3390,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             [destination.value.encode("ascii")]
             if destination != KVTransferDestination.DEVICE
             else []
+        ) + (
+            # The receiver has bound all four read-only peer views. Writes still go to
+            # the original rank-local buffers, including those sent by legacy senders.
+            [b"sglang-q8-owner-mla78-tp4-v1"]
+            if destination == KVTransferDestination.HOST
+            and not is_dummy
+            and getattr(self, "owner_layer_receive_ready", False)
+            else []
         )
 
 

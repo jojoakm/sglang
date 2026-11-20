@@ -19,6 +19,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -218,6 +219,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     if draft_buffer_infos
                     else buffer_info.data_ptrs
                 )
+        if (envs.SGLANG_DISAGG_OWNER_LAYER_RECEIVE.get() and target_layer_num == 78
+                and self.layer_num == 79 and layout == "layer_first"):
+            allocator_type = "shm"
         super().__init__(
             dtype=self.dtype,
             device_capacity_tokens=device_capacity_tokens,

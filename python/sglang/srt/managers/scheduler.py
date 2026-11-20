@@ -1970,6 +1970,15 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.SGLANG_DISAGG_OWNER_LAYER_RECEIVE.get()
+        ):
+            # Every owner rank has stopped its scheduler loop. Never predicate
+            # this collective on a rank's local receiver/restore queue.
+            self.tree_cache.drain_owner_layer_restores(
+                quiesce_writers=self.disagg_decode_transfer_queue.wait_for_host_writers
+            )
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -5466,6 +5475,10 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
                 idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+                if envs.SGLANG_DISAGG_OWNER_LAYER_RECEIVE.get():
+                    # A locally aborted request can have left all ordinary
+                    # queues while its host pages still have remote TP readers.
+                    idle &= not self.tree_cache.owner_layer_has_pending_reads()
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 

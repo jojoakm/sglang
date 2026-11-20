@@ -327,6 +327,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self._pending_restore_backups: list[tuple[object, RetractionBackup]] = []
         # Only the opt-in host-receive batch path shares one event across rows.
         self._pending_host_restore_backups: dict[int, _PendingHostRestore] = {}
+        # A fresh, strongly held native finish event identifies each restore,
+        # even after an abort reuses the request row or the controller ring slot.
+        self._owner_restore_batches: dict[
+            int, tuple[object, tuple[RetractionBackup, ...]]
+        ] = {}
+        self._owner_restore_submitting: tuple[RetractionBackup, ...] = ()
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
@@ -621,6 +627,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        self._require_owner_reads_drained()
+        ctx = getattr(self, "owner_layer_context", None)
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
+            self.owner_layer_context = None
+            self.owner_layer_views = None
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -1590,6 +1602,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _discard_restore_backups(self) -> None:
         """Wait for every pending restore copy and return its host slots."""
+        self._require_owner_reads_drained()
         for finish_event, backup in self._pending_restore_backups:
             finish_event.synchronize()
             self.discard_kv_cache_backup(backup)
@@ -1624,7 +1637,8 @@ class UnifiedRadixCache(BasePrefixCache):
             kv.restore_done_event.synchronize()
         del self._pending_host_restore_backups[id(kv)]
         kv.restore_done_event = None
-        self.discard_kv_cache_backup(backup)
+        if not backup.owner_layer_receive:
+            self.discard_kv_cache_backup(backup)
 
     def restore_waits_for_ack(self, req: Req) -> bool:
         return id(req.kv) in self._pending_host_restore_backups
@@ -1636,6 +1650,58 @@ class UnifiedRadixCache(BasePrefixCache):
             for pending in tuple(pending_restores.values()):
                 if pending.kv.restore_done_event is finish_event:
                     self._finish_host_restore(pending, already_done=True)
+        if batches := getattr(self, "_owner_restore_batches", None):
+            owner = batches.pop(id(finish_event), None)
+            if owner is not None:
+                event, backups = owner
+                assert event is finish_event
+                for i, backup in enumerate(backups):
+                    try:
+                        self.discard_kv_cache_backup(backup)
+                    except Exception:
+                        # A pool may have returned only some of the sidecars.
+                        # Quarantine the remaining ownership until group teardown.
+                        self._owner_restore_submitting += backups[i:]
+                        raise
+
+    def _register_owner_layer_restore(self, finish_event, shared):
+        if self._owner_restore_submitting is not shared or id(finish_event) in self._owner_restore_batches:
+            raise RuntimeError("Shared restore has no unique native completion event")
+        self._owner_restore_batches[id(finish_event)] = (finish_event, shared)
+
+    def _commit_owner_layer_restore(self, shared):
+        if self._owner_restore_submitting is not shared:
+            raise RuntimeError("Unexpected shared restore submission")
+        self._owner_restore_submitting = ()
+
+    def owner_layer_has_pending_reads(self):
+        return bool(
+            getattr(self, "_owner_restore_batches", None)
+            or getattr(self, "_owner_restore_submitting", None)
+        )
+
+    def _require_owner_reads_drained(self):
+        if self.owner_layer_has_pending_reads():
+            raise RuntimeError("Shared host sources await a certified TP load ack")
+
+    def drain_owner_layer_restores(self, *, quiesce_writers):
+        """Whole-TP maintenance only, with new admissions stopped on every rank."""
+        error = None
+        try:
+            quiesce_writers()
+            for ack in self.cache_controller.ack_load_queue:
+                ack.finish_event.synchronize()
+        except Exception as exc:
+            error = exc
+        failed = torch.tensor(
+            [int(bool(self._owner_restore_submitting) or error is not None)],
+            dtype=torch.int64, device="cpu",
+        )
+        self._all_reduce(failed, torch.distributed.ReduceOp.MAX)
+        if failed.item():
+            raise RuntimeError("Uncertified shared transfer; quarantine arena until group teardown") from error
+        self.loading_check()
+        self._require_owner_reads_drained()
 
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
@@ -1689,6 +1755,8 @@ class UnifiedRadixCache(BasePrefixCache):
         has completed. Page moves and frees wait for the copy as for a HiCache
         load; the host slots stay reserved until finish_restore_kv_cache, or
         freeing the row (free_kv_row), returns them after the copy."""
+        if backup.owner_layer_receive:
+            raise RuntimeError("Shared owner reads require the rank-agreed batched restore")
         operation = self._prepare_restore_operation(req, backup)
         load_host, load_device, load_pools = self.cache_controller._move_op_indices(
             operation
@@ -1711,6 +1779,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         assert self.has_free_load_back_slot()
         operations = []
+        owner_requests = {}
         for req in reqs:
             assert req.kv.restore_done_event is None
             assert req.kv.retraction_backup is not None
@@ -1718,22 +1787,52 @@ class UnifiedRadixCache(BasePrefixCache):
             # Request rows are owned by the restore ledger, not by tree nodes.
             operation.node_ids = []
             operations.append(operation)
+            if req.kv.retraction_backup.owner_layer_receive:
+                owner_requests[operation] = req
         cc = self.cache_controller
+        shared = ()
+        owner_read_plan = None
+        if owner_requests:
+            from sglang.srt.mem_cache.owner_layer_receive import (
+                OwnerPlanRejectedBeforeRead,
+                prepare_owner_read_plan,
+            )
+
+            if self._owner_restore_submitting:
+                raise RuntimeError("Previous shared restore has no certified ack")
+            shared = tuple(
+                req.kv.retraction_backup for req in owner_requests.values()
+            )
+            self._owner_restore_submitting = shared
+            try:
+                owner_read_plan = prepare_owner_read_plan(
+                    self.owner_layer_views,
+                    self.attn_tp_group,
+                    [*cc.load_queue, *operations],
+                    owner_requests,
+                )
+            except OwnerPlanRejectedBeforeRead:
+                self._commit_owner_layer_restore(shared)
+                raise
         queue_offset = len(cc.load_queue)
         cc.load_queue.extend(operations)
         try:
-            cc.start_loading()
+            cc.start_loading(owner_read_plan=owner_read_plan)
         except Exception:
             # Preparation can fail before start_loading clears the queue. Keep
             # ownership on the requests and remove only this failed submission.
             del cc.load_queue[queue_offset:]
             raise
         finish_event = cc.ack_load_queue[-1].finish_event
+        if shared:
+            self._register_owner_layer_restore(finish_event, shared)
         for req in reqs:
             req.kv.restore_done_event = finish_event
             self._pending_host_restore_backups[id(req.kv)] = _PendingHostRestore(
                 req.kv, req.kv.retraction_backup
             )
+        if shared:
+            self._commit_owner_layer_restore(shared)
 
     def _prepare_restore_operation(
         self, req: Req, backup: RetractionBackup
@@ -1778,6 +1877,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self._finish_restore(req.kv)
 
     def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
+        if backup.owner_layer_receive and (
+            any(other is backup for other in self._owner_restore_submitting)
+            or any(
+                other is backup
+                for _, batch in self._owner_restore_batches.values()
+                for other in batch
+            )
+        ):
+            raise RuntimeError("Attempted to recycle a shared host source before its TP ack")
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 

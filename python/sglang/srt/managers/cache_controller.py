@@ -1025,7 +1025,7 @@ class HiCacheController:
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
-    def start_loading(self) -> int:
+    def start_loading(self, *, owner_read_plan=None) -> int:
         if len(self.load_queue) == 0:
             return -1
 
@@ -1044,8 +1044,15 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
+        transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
+        )
+        if owner_read_plan is not None:
+            from sglang.srt.mem_cache.owner_layer_receive import main_restore_plan
+
+            transfers = main_restore_plan(transfers, *owner_read_plan)
         completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
