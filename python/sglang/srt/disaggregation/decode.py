@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.utils import kvt_enabled, kvt_timeline
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -371,6 +372,8 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
     host_staged: bool = False
+    kvt_transfer_ready_logged: bool = False
+    kvt_l1_blocked_logged: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -1896,6 +1899,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_indices,
             **metadata_kwargs,
         )
+        req = decode_req.req
+        if kvt_enabled(req.bootstrap_room):
+            kvt_timeline(
+                "decode",
+                "d_preallocated",
+                room=req.bootstrap_room,
+                rid=req.rid,
+                tp_rank=self.tp_rank,
+                destination=metadata_kwargs.get(
+                    "destination", KVTransferDestination.DEVICE
+                ).value,
+                decode_prefix_len=metadata_kwargs.get("decode_prefix_len", 0),
+                pages=len(page_indices),
+                is_rebootstrap=decode_req.is_rebootstrap,
+            )
         if (
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
@@ -1979,14 +1997,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             destination=KVTransferDestination.HOST,
         )
         decode_req.host_staged = True
+        req = decode_req.req
+        if kvt_enabled(req.bootstrap_room):
+            kvt_timeline(
+                "decode",
+                "d_host_preallocated",
+                room=req.bootstrap_room,
+                rid=req.rid,
+                tp_rank=self.tp_rank,
+                host_tokens=num_tokens,
+                host_reserve_tokens=self.host_reserved_tokens,
+                host_swa_tokens=swa_num_tokens,
+            )
         if self.scheduler.metrics_reporter.current_scheduler_metrics_enabled:
             self.scheduler.metrics_collector.increment_decode_host_receive_reqs()
         return True
 
     def allocate_host_staged(self, decode_req: DecodeRequest) -> bool:
-        if self.req_to_token_pool.available_size() <= 0:
-            return False
         req = decode_req.req
+        if self.req_to_token_pool.available_size() <= 0:
+            if not decode_req.kvt_l1_blocked_logged and kvt_enabled(req.bootstrap_room):
+                decode_req.kvt_l1_blocked_logged = True
+                kvt_timeline(
+                    "decode",
+                    "d_l1_blocked",
+                    room=req.bootstrap_room,
+                    rid=req.rid,
+                    tp_rank=self.tp_rank,
+                    reason="request_slots",
+                )
+            return False
         retractable_tokens = sum(
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
@@ -2023,9 +2063,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens=full_allocatable_tokens,
             swa_allocatable_tokens=swa_allocatable_tokens,
         ):
+            if not decode_req.kvt_l1_blocked_logged and kvt_enabled(req.bootstrap_room):
+                decode_req.kvt_l1_blocked_logged = True
+                kvt_timeline(
+                    "decode",
+                    "d_l1_blocked",
+                    room=req.bootstrap_room,
+                    rid=req.rid,
+                    tp_rank=self.tp_rank,
+                    reason="kv_budget",
+                    required_tokens=required_tokens,
+                    allocatable_tokens=full_allocatable_tokens,
+                    swa_required_tokens=swa_required_tokens,
+                    swa_allocatable_tokens=swa_allocatable_tokens,
+                )
             return False
         self._pre_alloc(req)
         decode_req.host_staged = False
+        if kvt_enabled(req.bootstrap_room):
+            kvt_timeline(
+                "decode",
+                "d_l1_allocated",
+                room=req.bootstrap_room,
+                rid=req.rid,
+                tp_rank=self.tp_rank,
+                required_tokens=required_tokens,
+                allocated_tokens=req.kv.kv_allocated_len,
+            )
         return True
 
     @property
@@ -2891,6 +2955,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # teardown below.
         deferred_indices = set()
         failed: List[Tuple[int, DecodeRequest, bool]] = []
+        timeline = kvt_enabled()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -2953,7 +3018,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._record_transfer_failure(failure_reason)
                 continue
             elif poll == KVPoll.Success:
-                if self._is_host_destination(decode_req):
+                host_destination = self._is_host_destination(decode_req)
+                if timeline and kvt_enabled(decode_req.req.bootstrap_room):
+                    destination = (
+                        KVTransferDestination.HOST
+                        if host_destination
+                        else KVTransferDestination.DEVICE
+                    ).value
+                    if not decode_req.kvt_transfer_ready_logged:
+                        decode_req.kvt_transfer_ready_logged = True
+                        kvt_timeline(
+                            "decode",
+                            "d_transfer_ready",
+                            room=decode_req.req.bootstrap_room,
+                            rid=decode_req.req.rid,
+                            tp_rank=self.tp_rank,
+                            destination=destination,
+                        )
+                else:
+                    destination = None
+                if host_destination:
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         self.scheduler.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
@@ -2982,6 +3066,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     )
                 else:
                     transferred_reqs.append(decode_req.req)
+                    if destination is not None:
+                        kvt_timeline(
+                            "decode",
+                            "d_transfer_committed",
+                            room=decode_req.req.bootstrap_room,
+                            rid=decode_req.req.rid,
+                            tp_rank=self.tp_rank,
+                            destination=destination,
+                        )
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -3503,6 +3596,17 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if kvt_enabled():
+            tp_rank = get_parallel().tp_rank
+            for req in can_run_list:
+                kvt_timeline(
+                    "decode",
+                    "d_batch_selected",
+                    room=req.bootstrap_room,
+                    rid=req.rid,
+                    tp_rank=tp_rank,
+                    batch_size=len(can_run_list),
+                )
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

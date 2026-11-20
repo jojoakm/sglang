@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.common.utils import kvt_enabled, kvt_timeline
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -973,6 +974,14 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                if kvt_enabled(req.bootstrap_room):
+                    kvt_timeline(
+                        "prefill",
+                        "prefill_finished",
+                        room=req.bootstrap_room,
+                        rid=req.rid,
+                        pending_bootstrap=req.pending_bootstrap,
+                    )
 
                 # Its KV never landed: abort instead of sending it to decode.
                 if req.discard_output_reason is not None:
@@ -1032,6 +1041,14 @@ class SchedulerDisaggregationPrefillMixin:
 
                 self.checkpoint_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
+                if kvt_enabled(req.bootstrap_room):
+                    kvt_timeline(
+                        "prefill",
+                        "p_inflight",
+                        room=req.bootstrap_room,
+                        rid=req.rid,
+                        pending_bootstrap=req.pending_bootstrap,
+                    )
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
@@ -1233,6 +1250,13 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+                if kvt_enabled(req.bootstrap_room):
+                    kvt_timeline(
+                        "prefill",
+                        "p_transfer_complete",
+                        room=req.bootstrap_room,
+                        rid=req.rid,
+                    )
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)

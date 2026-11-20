@@ -47,6 +47,12 @@ from sglang.srt.disaggregation.common.utils import (
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
+    kvt_chunk_metadata,
+    kvt_current_context,
+    kvt_enabled,
+    kvt_reset_context,
+    kvt_set_context,
+    kvt_timeline,
     pack_int_lists,
     run_on_device,
     unpack_int_lists,
@@ -91,6 +97,53 @@ from sglang.srt.utils.common import is_cuda
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+
+def _transfer_submitter(executor):
+    timeline = kvt_current_context()
+    if not timeline:
+        return executor.submit
+
+    def run(fn, *args):
+        # Propagate only the timeline, leaving other ContextVars unchanged.
+        token = kvt_set_context(timeline)
+        try:
+            return fn(*args)
+        finally:
+            kvt_reset_context(token)
+
+    def submit(fn, *args):
+        return executor.submit(run, fn, *args)
+
+    return submit
+
+
+def _timed_batch_transfer(engine, session_id, src_addrs, dst_addrs, lengths, timeline):
+    fields = dict(
+        timeline, session=session_id, blocks=len(lengths), bytes=int(sum(lengths))
+    )
+    kvt_timeline("engine", "engine_begin", **fields)
+    started = time.perf_counter()
+    try:
+        ret = engine.batch_transfer_sync(session_id, src_addrs, dst_addrs, lengths)
+    except Exception as error:
+        kvt_timeline(
+            "engine",
+            "engine_end",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            error=type(error).__name__,
+            **fields,
+        )
+        raise
+    kvt_timeline(
+        "engine",
+        "engine_end",
+        duration_ms=(time.perf_counter() - started) * 1000,
+        ret=int(ret),
+        **fields,
+    )
+    return ret
+
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -693,7 +746,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # block other rooms on this single worker thread.
             with self._staging_ctx.watermark_cv:
                 self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
+            timeline = kvt_current_context()
+            if timeline:
+                ts = time.time()
+                monotonic_ns = time.monotonic_ns()
+                kv_chunk.enqueued_at = time.perf_counter()
             queue.put(kv_chunk)
+            if timeline:
+                kvt_timeline(
+                    "worker",
+                    "requeue",
+                    ts=ts,
+                    monotonic_ns=monotonic_ns,
+                    queue_depth=queue.qsize(),
+                    **timeline,
+                )
             return (-1, True)
 
         ret = staging_strategy.transfer(
@@ -892,11 +959,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def _transfer_data(self, mooncake_session_id, transfer_blocks, timeline=None):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        if timeline is None:
+            timeline = kvt_current_context()
+        if timeline and kvt_enabled(timeline.get("room")):
+            return _timed_batch_transfer(
+                self.engine,
+                mooncake_session_id,
+                list(src_addrs),
+                list(dst_addrs),
+                list(lengths),
+                timeline,
+            )
         return self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
@@ -1285,8 +1363,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
+            submit = _transfer_submitter(executor)
             futures = [
-                executor.submit(
+                submit(
                     process_layer,
                     src_ptr,
                     dst_ptr,
@@ -1700,12 +1779,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         if self.enable_custom_mem_pool:
+            submit = _transfer_submitter(executor)
             futures = [
-                executor.submit(process_layer, *layer_params)
+                submit(process_layer, *layer_params)
                 for layer_params in layers_params
             ]
             futures.extend(
-                executor.submit(process_sliced_draft, [params])
+                submit(process_sliced_draft, [params])
                 for params in sliced_draft_params
             )
             try:
@@ -1844,12 +1924,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
+            timeline = kvt_current_context()
+            if timeline:
+                return _timed_batch_transfer(
+                    self.engine,
+                    mooncake_session_id,
+                    src_addr_list,
+                    dst_addr_list,
+                    length_list,
+                    timeline,
+                )
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
+        submit = _transfer_submitter(executor)
         futures = [
-            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
+            submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
             for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
         ]
 
@@ -2537,8 +2628,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "Using SWA state head-slice transfer for different attention TP sizes: "
             f"prefill={self.attn_tp_size}, decode={dst_attn_tp_size}."
         )
+        submit = _transfer_submitter(executor)
         futures = [
-            executor.submit(
+            submit(
                 self._transfer_data,
                 req.mooncake_session_id,
                 list(
@@ -2580,6 +2672,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
+            timeline_token = None
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -2587,6 +2680,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                timeline_on = kvt_enabled(kv_chunk.room)
+                if timeline_on:
+                    tp_rank = getattr(self, "attn_tp_rank", None)
+                    kvt_timeline(
+                        "worker",
+                        "dequeue",
+                        queue_wait_ms=(
+                            (time.perf_counter() - kv_chunk.enqueued_at) * 1000
+                            if kv_chunk.enqueued_at > 0
+                            else None
+                        ),
+                        queue_depth=queue.qsize(),
+                        tp_rank=tp_rank,
+                        **kvt_chunk_metadata(kv_chunk, worker_index),
+                    )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2607,16 +2715,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the worker, not the scheduler, before reading source KV.
                 # A room that already failed skips the wait; the status check
                 # below then drops the chunk, including on an abort during it.
+                gpu_wait_start = None
                 if kv_chunk.wait_event is not None:
                     if (
                         kv_chunk.room in self.request_status
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
+                        if timeline_on:
+                            gpu_wait_start = time.perf_counter()
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
+                    if timeline_on and gpu_wait_start is None:
+                        gpu_wait_start = time.perf_counter()
                     kv_chunk.indices_event.synchronize()
                     kv_chunk.indices_event = None
+                if gpu_wait_start is not None:
+                    kvt_timeline(
+                        "worker",
+                        "gpu_wait_end",
+                        duration_ms=(time.perf_counter() - gpu_wait_start) * 1000,
+                        tp_rank=tp_rank,
+                        **kvt_chunk_metadata(kv_chunk, worker_index),
+                    )
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
@@ -2656,6 +2777,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
                 for req in reqs_to_be_processed:
+                    if timeline_on:
+                        context = kvt_chunk_metadata(
+                            kv_chunk, worker_index, req.mooncake_session_id
+                        )
+                        context["destination"] = req.destination.value
+                        context["tp_rank"] = tp_rank
+                        timeline_token = kvt_set_context(context)
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -2903,6 +3031,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         else f"Failed to send aux data of {req.room}"
                                     ),
                                 )
+                                if timeline_on:
+                                    kvt_timeline(
+                                        "worker",
+                                        "conclude_transfer",
+                                        status=int(status),
+                                        **context,
+                                    )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -2915,6 +3050,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
                             start_ts,
                         )
+                    if timeline_token is not None:
+                        kvt_reset_context(timeline_token)
+                        timeline_token = None
+
+                # A failed or deferred destination can break out before the
+                # normal per-destination cleanup above.
+                if timeline_token is not None:
+                    kvt_reset_context(timeline_token)
+                    timeline_token = None
 
                 if self.enable_trace:
                     kv_chunk.trace_ctx.trace_slice_end(
@@ -2966,6 +3110,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if timeline_token is not None:
+                    kvt_reset_context(timeline_token)
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -3204,19 +3351,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-                indices_event=indices_event,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            wait_event=wait_event,
+            indices_event=indices_event,
+        )
+        queue = self.transfer_queues[shard_idx]
+        if not kvt_enabled(bootstrap_room):
+            queue.put(chunk)
+            return
+
+        # The consumer can run immediately after put. Snapshot enqueue time
+        # first so timeline reconstruction sees the actual queue ordering.
+        metadata = kvt_chunk_metadata(chunk, shard_idx, "|".join(dst_infos))
+        ts = time.time()
+        monotonic_ns = time.monotonic_ns()
+        chunk.enqueued_at = time.perf_counter()
+        queue.put(chunk)
+        kvt_timeline(
+            "prefill",
+            "enqueue",
+            ts=ts,
+            monotonic_ns=monotonic_ns,
+            num_pages=len(kv_indices),
+            num_kv_tokens=num_kv_tokens,
+            queue_depth=queue.qsize(),
+            tp_rank=getattr(self, "attn_tp_rank", None),
+            **metadata,
         )
 
     def get_session_id(self):

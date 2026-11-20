@@ -1,17 +1,26 @@
+import contextvars
 import ctypes
 import dataclasses
+import json
+import logging
+import os
 import struct
 import threading
+import time
 from collections import deque
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
 )
+
+logger = logging.getLogger(__name__)
+_KVT_CONTEXT = contextvars.ContextVar("sglang_kvt_context", default=None)
 
 
 @dataclasses.dataclass
@@ -35,6 +44,52 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    enqueued_at: float = 0.0
+
+
+def kvt_enabled(room: Optional[int] = None) -> bool:
+    if not envs.SGLANG_DEBUG_KVT_TIMELINE.get():
+        return False
+    sample_every = max(1, envs.SGLANG_DEBUG_KVT_TIMELINE_SAMPLE_EVERY.get())
+    return room is None or int(room) % sample_every == 0
+
+
+def kvt_chunk_metadata(chunk, worker_index=None, session_id=None):
+    return {
+        "room": int(chunk.room),
+        "worker": worker_index,
+        "session": session_id,
+        "chunk_start": chunk.index_slice.start,
+        "chunk_end": chunk.index_slice.stop,
+        "last_chunk": chunk.is_last_chunk,
+    }
+
+
+def kvt_set_context(context):
+    return _KVT_CONTEXT.set(context)
+
+
+def kvt_reset_context(token):
+    _KVT_CONTEXT.reset(token)
+
+
+def kvt_current_context():
+    return _KVT_CONTEXT.get()
+
+
+def kvt_timeline(component, event, **fields):
+    if not kvt_enabled(fields.get("room")):
+        return
+    payload = {
+        "event": event,
+        "component": component,
+        "ts": time.time(),
+        "monotonic_ns": time.monotonic_ns(),
+        "pid": os.getpid(),
+        "thread_id": threading.get_native_id(),
+        **fields,
+    }
+    logger.info("KVT_TIMELINE %s", json.dumps(payload, separators=(",", ":")))
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
@@ -94,6 +149,10 @@ class FastQueue:
     def __init__(self):
         self._buf = deque()
         self._cond = threading.Condition()
+
+    def qsize(self) -> int:
+        with self._cond:
+            return len(self._buf)
 
     def put(self, item):
         with self._cond:

@@ -21,6 +21,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.disaggregation.common.utils import kvt_enabled, kvt_timeline
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -121,6 +122,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_observability,
+    get_parallel,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align, get_device_module, is_npu
@@ -190,6 +192,7 @@ class _PendingHostRestore(NamedTuple):
     kv: ReqKvInfo
     finish_event: object
     backup: RetractionBackup
+    timeline: Optional[tuple[int, str, int]] = None
 
 
 class _StoragePrefetchWait(msgspec.Struct):
@@ -1637,12 +1640,29 @@ class UnifiedRadixCache(BasePrefixCache):
     def restore_waits_for_ack(self, req: Req) -> bool:
         return id(req.kv) in self._pending_host_restore_backups
 
-    def _finish_restore_ack(self, finish_event: object) -> None:
+    def _finish_restore_ack(
+        self, finish_event: object
+    ) -> Optional[tuple[int, list[int]]]:
         # Several requests may share one merged copy. Release by row identity,
         # including when an abort already returned another row in this batch.
+        timeline_batch = None
         for pending in tuple(self._pending_host_restore_backups.values()):
             if pending.finish_event is finish_event:
                 self._finish_host_restore(pending.kv, already_done=True)
+                if pending.timeline is not None:
+                    room, rid, batch_id = pending.timeline
+                    if timeline_batch is None:
+                        timeline_batch = (batch_id, [])
+                    timeline_batch[1].append(room)
+                    kvt_timeline(
+                        "decode",
+                        "d_restore_ack",
+                        room=room,
+                        rid=rid,
+                        tp_rank=get_parallel().tp_rank,
+                        restore_batch=batch_id,
+                    )
+        return timeline_batch
 
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
@@ -1711,6 +1731,15 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         req.kv.restore_done_event = completion.finish_event
         self._pending_restore_backups.append((completion.finish_event, backup))
+        if req.bootstrap_room is not None and kvt_enabled(req.bootstrap_room):
+            kvt_timeline(
+                "decode",
+                "d_restore_submitted",
+                room=req.bootstrap_room,
+                rid=req.rid,
+                mode="unbatched",
+                host_tokens=len(backup.host_indices),
+            )
 
     def start_restore_kv_cache_batch(self, reqs: list[Req]) -> None:
         """Merge host-received rows into one native load/ack-ring submission."""
@@ -1743,11 +1772,34 @@ class UnifiedRadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
             (id(self), "restore"), finish_event
         )
+        timeline = kvt_enabled()
+        batch_id = None
         for req in reqs:
+            timeline_fields = None
+            if (
+                timeline
+                and req.bootstrap_room is not None
+                and kvt_enabled(req.bootstrap_room)
+            ):
+                if batch_id is None:
+                    batch_id = time.monotonic_ns()
+                timeline_fields = (req.bootstrap_room, req.rid, batch_id)
             req.kv.restore_done_event = finish_event
             self._pending_host_restore_backups[id(req.kv)] = _PendingHostRestore(
-                req.kv, finish_event, req.kv.retraction_backup
+                req.kv, finish_event, req.kv.retraction_backup, timeline_fields
             )
+            if timeline_fields is not None:
+                kvt_timeline(
+                    "decode",
+                    "d_restore_submitted",
+                    room=req.bootstrap_room,
+                    rid=req.rid,
+                    mode="batched",
+                    tp_rank=get_parallel().tp_rank,
+                    restore_batch=batch_id,
+                    batch_size=len(reqs),
+                    host_tokens=len(req.kv.retraction_backup.host_indices),
+                )
 
     def _prepare_restore_operation(
         self, req: Req, backup: RetractionBackup
@@ -3736,7 +3788,7 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
-            self._finish_restore_ack(ack.finish_event)
+            timeline_batch = self._finish_restore_ack(ack.finish_event)
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
@@ -3749,6 +3801,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
 
+            duration_ms = None
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
                     if num_tokens > 0:
@@ -3762,6 +3815,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.metrics_collector.observe_load_back_duration(
                         duration_ms / 1000.0
                     )
+            if timeline_batch is not None:
+                batch_id, sampled_rooms = timeline_batch
+                if duration_ms is None and ack.timing_enabled:
+                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+                kvt_timeline(
+                    "decode",
+                    "d_restore_batch_ack",
+                    room=sampled_rooms[0],
+                    sampled_rooms=sampled_rooms,
+                    tp_rank=get_parallel().tp_rank,
+                    restore_batch=batch_id,
+                    bytes=ack.num_bytes,
+                    cuda_duration_ms=duration_ms,
+                )
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
