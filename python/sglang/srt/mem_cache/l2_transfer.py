@@ -10,6 +10,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
 from sglang.srt.utils import get_device_module
+from sglang.srt.utils.cuda_workqueues import new_stream
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -55,7 +56,7 @@ class L2TransferEngine:
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
         self.device_to_host_stream = device_module.Stream()
-        self.host_to_device_stream = device_module.Stream()
+        self.host_to_device_stream = new_stream(device_module, "h2d")
         # Index preparation runs here, never queued behind earlier copies: the
         # direct backend reads the device indices back on the host.
         self.index_stream = device_module.Stream()

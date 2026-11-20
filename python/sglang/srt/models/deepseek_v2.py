@@ -2959,8 +2959,10 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        from sglang.srt.utils import cuda_workqueues
+
         self.alt_stream = (
-            torch.cuda.Stream()
+            cuda_workqueues.new_stream(torch.cuda, "model")
             if (
                 _is_cuda
                 or _is_musa
