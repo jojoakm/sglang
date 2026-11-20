@@ -393,6 +393,15 @@ def start_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     req.kv.retraction_backup = None
 
 
+def start_restore_kv_cache_batch(reqs: list[Req], tree_cache: BasePrefixCache) -> None:
+    """Submit candidate host-received rows together; the ack releases their slots."""
+    reqs = [req for req in reqs if req.seqlen > 1]
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    unified_cache.start_restore_kv_cache_batch(reqs)
+    for req in reqs:
+        req.kv.retraction_backup = None
+
+
 def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     """Return the host slots of ``req``'s restore once its copy has finished."""
     unified_cache = cast("UnifiedRadixCache", tree_cache)

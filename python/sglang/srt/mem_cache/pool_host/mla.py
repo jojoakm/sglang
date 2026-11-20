@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.pool_host.npu_memfabric import (
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils.cuda_workqueues import enabled as workqueue_isolation_enabled
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -730,6 +731,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
+                        **({"block_quota": 8} if workqueue_isolation_enabled() else {}),
                     )
                 else:
                     self._require_packed_device_rows("transfer_kv_per_layer_mla")
@@ -739,6 +741,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        **({"block_quota": 8} if workqueue_isolation_enabled() else {}),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
