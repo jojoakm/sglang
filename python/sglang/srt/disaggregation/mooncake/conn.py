@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
 import threading
 import time
+from bisect import bisect_right
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -175,6 +177,7 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
     destination: KVTransferDestination = KVTransferDestination.DEVICE
+    shared_main_v1: bool = dataclasses.field(default=False, kw_only=True)
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -197,6 +200,12 @@ class TransferInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
+            shared_main_v1=(
+                not is_dummy
+                and len(msg) > 11
+                and msg[10] == b"host"
+                and msg[11] == OWNER_MLA_V1
+            ),
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
@@ -347,6 +356,95 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
+def _owned_mla_ptrs(manager, rank, dst_ptrs, dst_tp_size, dst_item_len, dst_layer_ids):
+    """Identify whole registered target layers by their source pointer before native batching."""
+    kv = manager.kv_args
+    if (
+        rank != manager.attn_tp_rank
+        or rank not in range(4)
+        or not manager.is_mla_backend
+        or (manager.pp_size, manager.attn_tp_size, dst_tp_size) != (1, 4, 4)
+        or kv.page_size != 64
+        or kv.num_draft_entries != 1
+        or kv.prefill_start_layer != 0
+        or kv.mla_compression_ratios is not None
+        or kv.kv_layer_ids
+        or dst_layer_ids
+    ):
+        raise ValueError("Expected the registered plain TP4 MLA layout")
+    # PP1 GLM records target layers in order, followed by one packed draft entry.
+    # Source and destination have independent virtual addresses and physical page IDs.
+    valid_ptrs = all(
+        len(ptrs) == 79 and len(set(ptrs)) == 79 and min(ptrs) > 0
+        for ptrs in (kv.kv_data_ptrs, dst_ptrs)
+    )
+    if (
+        not valid_ptrs
+        or list(kv.kv_item_lens) != [64 * 576] * 79
+        or dst_item_len != 64 * 576
+    ):
+        raise ValueError(
+            "Expected 78 target MLA buffers and one appended draft buffer on each peer"
+        )
+    return set(kv.kv_data_ptrs[rank:78:4]) | {kv.kv_data_ptrs[-1]}
+
+
+OWNER_MLA_V1 = b"sglang-q8-owner-mla78-tp4-v1"
+
+
+def _owner_for_peer(manager, req, registration):
+    if not getattr(manager, "enable_owner_mla_send", False) or not req.shared_main_v1:
+        return None
+    if (
+        req.is_dummy
+        or req.destination != KVTransferDestination.HOST
+        or manager.attn_tp_rank != registration.dst_tp_rank
+        or registration.dst_attn_tp_size != 4
+    ):
+        raise ValueError("Invalid owner-layer peer or lane")
+    return manager.attn_tp_rank
+
+
+def _owner_trace_fields(manager, chunk):
+    if getattr(manager, "owner_mla_trace_room", -1) != chunk.room:
+        return None
+    return dict(
+        room=chunk.room,
+        rank=manager.attn_tp_rank,
+        pid=os.getpid(),
+        last=chunk.is_last_chunk,
+        start_page=chunk.index_slice.start,
+        stop_page=chunk.index_slice.stop,
+        num_kv_tokens=chunk.num_kv_tokens,
+    )
+
+
+def _owner_native_record(kv, blocks):
+    """Decode submitted source addresses against the original per-layer registrations."""
+    spans = sorted(
+        (int(p), int(n), i)
+        for i, (p, n) in enumerate(zip(kv.kv_data_ptrs, kv.kv_data_lens))
+    )
+    bases = [p for p, _, _ in spans]
+    unknown = 0
+    layer_bytes = defaultdict(int)
+    for address, _, count in blocks:
+        j = bisect_right(bases, address) - 1
+        if j < 0 or address + count > spans[j][0] + spans[j][1]:
+            unknown += count
+        else:
+            layer_bytes[spans[j][2]] += count
+    target = {i: n for i, n in sorted(layer_bytes.items()) if i < 78}
+    return dict(
+        main_layers=list(target),
+        main_bytes=sum(target.values()),
+        draft_bytes=layer_bytes.get(78, 0),
+        native_bytes=sum(n for _, _, n in blocks),
+        native_descriptors=len(blocks),
+        unclassified_bytes=unknown,
+    )
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
@@ -377,6 +475,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_owner_mla_send = envs.SGLANG_MOONCAKE_OWNER_MLA_SEND.get()
+        self.owner_mla_trace_room = envs.SGLANG_MOONCAKE_OWNER_MLA_TRACE_ROOM.get()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -1189,6 +1289,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_ptrs: Optional[set[int]] = None,
         dst_item_lens: list[int] | None = None,
         bootstrap_room: Optional[int] = None,
+        owned_ptrs: Optional[set[int]] = None,
+        owner_trace: Optional[dict] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -1324,6 +1426,21 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        if owned_ptrs is not None:
+            layers_params = [entry for entry in layers_params if entry[0] in owned_ptrs]
+
+        submit_blocks = self._transfer_data
+        if owned_ptrs is not None and owner_trace is not None:
+
+            def submit_blocks(session, blocks):
+                rc = self._transfer_data(session, blocks)
+                if blocks:
+                    record = _owner_native_record(self.kv_args, blocks)
+                    logger.info(
+                        "PD_OWNER_MLA_NATIVE %s",
+                        json.dumps(dict(**owner_trace, **record, rc=rc)),
+                    )
+                return rc
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -1350,14 +1467,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return submit_blocks(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return submit_blocks(mooncake_session_id, transfer_blocks)
 
         if (
             self.enable_custom_mem_pool
@@ -1406,7 +1523,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_addr = dst_ptr + int(decode_index[0]) * item_len
                         length = item_len * len(prefill_index)
                         transfer_blocks.append((src_addr, dst_addr, length))
-                return self._transfer_data(mooncake_session_id, transfer_blocks)
+                return submit_blocks(mooncake_session_id, transfer_blocks)
 
             for start in range(
                 0,
@@ -1511,6 +1628,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        *,
+        owner_rank: Optional[int] = None,
+        owner_trace: Optional[dict] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1549,6 +1669,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            owner_trace=owner_trace,
+            owned_ptrs=(
+                _owned_mla_ptrs(
+                    self,
+                    owner_rank,
+                    dst_kv_ptrs,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                    dst_layer_ids,
+                )
+                if owner_rank is not None
+                else None
+            ),
         )
 
     def send_kvcache_dcp(
@@ -2915,6 +3048,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                owner_trace=_owner_trace_fields(self, kv_chunk),
+                                owner_rank=_owner_for_peer(
+                                    self, req, target_rank_registration_info
+                                ),
                             )
                         elif (
                             self.enable_staging
