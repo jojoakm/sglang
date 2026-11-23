@@ -495,7 +495,9 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        from sglang.srt.utils.cuda_workqueues import new_stream
+
+        self.forward_stream = new_stream(torch.get_device_module(self.device), "model")
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.

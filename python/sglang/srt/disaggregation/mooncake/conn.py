@@ -15,7 +15,12 @@ import numpy.typing as npt
 import torch
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferDestination,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -82,6 +87,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import is_cuda
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -115,6 +121,8 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    destination: KVTransferDestination = KVTransferDestination.DEVICE
+    shared_main_v1: bool = dataclasses.field(default=False, kw_only=True)
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -130,6 +138,11 @@ class TransferInfo:
             dst_aux_index = int(msg[5].decode("ascii"))
             dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
+        destination = (
+            KVTransferDestination(msg[10].decode("ascii"))
+            if len(msg) > 10
+            else KVTransferDestination.DEVICE
+        )
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -137,6 +150,12 @@ class TransferInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
+            shared_main_v1=(
+                not is_dummy
+                and len(msg) > 11
+                and destination == KVTransferDestination.HOST
+                and msg[11] == OWNER_MLA_V1
+            ),
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
@@ -148,6 +167,7 @@ class TransferInfo:
                 if len(msg) > 9 and msg[9] != b""
                 else None
             ),
+            destination=destination,
         )
 
 
@@ -176,11 +196,12 @@ class KVArgsRegisterInfo:
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    host_destination: Optional[tuple[List[int], List[List[int]]]] = None
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
-        return cls(
+        info = cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -229,6 +250,30 @@ class KVArgsRegisterInfo:
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
+        if len(msg) > 20 and msg[20]:
+            # Pool exporters verify identical host/device page strides. The
+            # auxiliary completion buffers stay on the device.
+            info.host_destination = (
+                list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20])),
+                unpack_int_lists(msg[21], "Q"),
+            )
+        return info
+
+    def for_host_destination(self) -> KVArgsRegisterInfo:
+        if self.host_destination is None:
+            raise ValueError("Decode peer did not register a host KV destination")
+        # DCP relayout fields are derived after parsing the registration. Keep
+        # those current fields when selecting the alternative host pointers.
+        kv_ptrs, state_ptrs = self.host_destination
+        return dataclasses.replace(
+            self,
+            dst_kv_ptrs=kv_ptrs,
+            dst_state_data_ptrs=state_ptrs,
+            staging_base_ptr=0,
+            staging_total_size=0,
+            staging=None,
+            host_destination=None,
+        )
 
 
 def _uses_flat_entry_layout(
@@ -252,6 +297,50 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
+def _owned_mla_ptrs(manager, dst_ptrs, dst_tp_size, dst_item_len, dst_layer_ids):
+    """Identify whole registered target layers by their source pointer before native batching."""
+    kv = manager.kv_args
+    rank = manager.attn_tp_rank
+    if (
+        rank not in range(4)
+        or not manager.is_mla_backend
+        or (manager.pp_size, manager.attn_tp_size, dst_tp_size) != (1, 4, 4)
+        or kv.page_size != 64
+        or kv.num_draft_entries != 1
+        or kv.prefill_start_layer != 0
+        or kv.mla_compression_ratios is not None
+        or kv.kv_layer_ids
+        or dst_layer_ids
+    ):
+        raise ValueError("Expected the registered plain TP4 MLA layout")
+    # PP1 GLM records target layers in order, followed by one packed draft entry.
+    # Source and destination have independent virtual addresses and physical page IDs.
+    valid_ptrs = all(
+        len(ptrs) == 79 and len(set(ptrs)) == 79 and min(ptrs) > 0
+        for ptrs in (kv.kv_data_ptrs, dst_ptrs)
+    )
+    if (
+        not valid_ptrs
+        or list(kv.kv_item_lens) != [64 * 576] * 79
+        or dst_item_len != 64 * 576
+    ):
+        raise ValueError(
+            "Expected 78 target MLA buffers and one appended draft buffer on each peer"
+        )
+    return set(kv.kv_data_ptrs[rank:78:4]) | {kv.kv_data_ptrs[-1]}
+
+
+OWNER_MLA_V1 = b"sglang-q8-owner-mla78-tp4-v1"
+
+
+def _use_owner_mla_for_peer(manager, req, registration) -> bool:
+    if not (getattr(req, "shared_main_v1", False) and manager.enable_owner_mla_send):
+        return False
+    if manager.attn_tp_rank != registration.dst_tp_rank:
+        raise ValueError("Owner-layer send requires matching TP ranks")
+    return True
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
@@ -260,6 +349,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+
+    @property
+    def supports_host_transfer(self) -> bool:
+        return is_cuda() and self.enable_deferred_decode_kv_release
 
     def __init__(
         self,
@@ -278,6 +371,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_owner_mla_send = envs.SGLANG_MOONCAKE_OWNER_MLA_SEND.get()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -428,13 +522,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
             add(ptrs, lens)
+        if self.supports_host_destination:
+            add(self.kv_args.host_kv_data_ptrs, self.kv_args.host_kv_data_lens)
+            for ptrs, lens in zip(
+                self.kv_args.host_state_data_ptrs or [],
+                self.kv_args.host_state_data_lens or [],
+            ):
+                add(ptrs, lens)
         return regions
 
     def register_buffer_to_engine(self):
+        self.supports_host_destination = bool(self.kv_args.host_kv_data_ptrs)
+        if self.supports_host_destination and not self.supports_host_transfer:
+            raise ValueError(
+                "Mooncake host receive requires NVIDIA CUDA and deferred KV release"
+            )
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            status = self.engine.batch_register(list(ptrs), list(lens))
+            if self.supports_host_destination and status != 0:
+                raise RuntimeError(f"Mooncake HOST buffer registration failed: {status}")
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
@@ -671,7 +779,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         room_infos = self.transfer_infos.get(room, {})
         needs_staging = any(
-            not tinfo.is_dummy
+            tinfo.destination == KVTransferDestination.DEVICE
+            and not tinfo.is_dummy
             and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
             and self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
             != self.attn_tp_size
@@ -686,7 +795,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         prefetch_staging_reqs(
             room,
-            self.transfer_infos,
+            {
+                room: {
+                    peer: info
+                    for peer, info in room_infos.items()
+                    if info.destination == KVTransferDestination.DEVICE
+                }
+            },
             self.kv_buffer_tensors,
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
@@ -1042,6 +1157,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_ptrs: Optional[set[int]] = None,
         dst_item_lens: list[int] | None = None,
         bootstrap_room: Optional[int] = None,
+        owned_ptrs: Optional[set[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -1177,6 +1293,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        if owned_ptrs is not None:
+            layers_params = [entry for entry in layers_params if entry[0] in owned_ptrs]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -1363,6 +1481,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        *,
+        owner_mla: bool = False,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1401,6 +1521,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            owned_ptrs=(
+                _owned_mla_ptrs(
+                    self,
+                    dst_kv_ptrs,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                    dst_layer_ids,
+                )
+                if owner_mla
+                else None
+            ),
         )
 
     def send_kvcache_dcp(
@@ -2614,9 +2745,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 )
                                 break
 
-                        target_rank_registration_info: KVArgsRegisterInfo = (
-                            self.decode_kv_args_table[req.mooncake_session_id]
-                        )
+                        target_rank_registration_info = self.decode_kv_args_table[
+                            req.mooncake_session_id
+                        ]
+                        if getattr(req, "destination", None) == KVTransferDestination.HOST:
+                            target_rank_registration_info = (
+                                target_rank_registration_info.for_host_destination()
+                            )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -2712,6 +2847,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                **(
+                                    {"owner_mla": True}
+                                    if _use_owner_mla_for_peer(
+                                        self, req, target_rank_registration_info
+                                    )
+                                    else {}
+                                ),
                             )
                         elif (
                             self.enable_staging
@@ -3261,7 +3403,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
         )
 
-        return [
+        message = [
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
@@ -3286,6 +3428,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
         ]
+        if self.supports_host_destination:
+            host_ptrs = self.kv_args.host_kv_data_ptrs
+            message.append(struct.pack(f"{len(host_ptrs)}Q", *host_ptrs))
+            message.append(pack_int_lists(self.kv_args.host_state_data_ptrs or [], "Q"))
+        return message
 
     def build_receiver_metadata_message(
         self,
@@ -3298,8 +3445,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ) -> List[bytes]:
-        return [
+        message = [
             str(bootstrap_room).encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
@@ -3315,6 +3463,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if not is_dummy and device_kv_indices is not None
             else b"",
         ]
+        if destination == KVTransferDestination.HOST:
+            message.append(destination.value.encode("ascii"))
+            if not is_dummy and getattr(self, "owner_layer_receive_ready", False):
+                message.append(OWNER_MLA_V1)
+        return message
 
 
 class MooncakeKVSender(CommonKVSender):
@@ -3358,7 +3511,27 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    pass
+    @property
+    def supports_host_destination(self) -> bool:
+        return self.kv_mgr.supports_host_destination
+
+    def is_abort_release_safe(self) -> bool:
+        return self.kv_mgr.is_abort_release_safe(
+            self.bootstrap_room, len(self.bootstrap_infos)
+        )
+
+    def _register_kv_args(self) -> bool:
+        if self.bootstrap_infos and self.supports_host_destination and any(
+            not info.get("supports_host_transfer", False)
+            for info in self.bootstrap_infos
+        ):
+            self.kv_mgr.record_failure(
+                self.bootstrap_room, "Prefill peer does not support host transfer"
+            )
+            self.conclude_state = KVPoll.Failed
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            return False
+        return super()._register_kv_args()
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

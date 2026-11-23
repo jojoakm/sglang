@@ -14,6 +14,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
+_MODEL_SM_LIMIT = None
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -301,6 +302,16 @@ def update_deep_gemm_config(gpu_id: int):
     if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):
         deep_gemm.set_pdl(True)
 
+    # Set before warmup, model construction, DSA metadata sizing and graph capture.
+    # Device properties still describe the whole GPU, not this Green partition.
+    global _MODEL_SM_LIMIT
+    from sglang.srt.utils.cuda_workqueues import model_sm_count
+
+    _MODEL_SM_LIMIT = model_sm_count(gpu_id)
+    if _MODEL_SM_LIMIT is not None:
+        deep_gemm.set_num_sms(_MODEL_SM_LIMIT)
+        assert deep_gemm.get_num_sms() == _MODEL_SM_LIMIT
+
     compile_utils.update_deep_gemm_config(gpu_id)
 
 
@@ -310,6 +321,9 @@ def configure_deep_gemm_num_sms(num_sms):
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()
+        if _MODEL_SM_LIMIT is not None:
+            num_sms = _MODEL_SM_LIMIT if num_sms == 0 else min(num_sms, _MODEL_SM_LIMIT)
+            original_num_sms = min(original_num_sms, _MODEL_SM_LIMIT)
         deep_gemm.set_num_sms(num_sms)
         try:
             yield

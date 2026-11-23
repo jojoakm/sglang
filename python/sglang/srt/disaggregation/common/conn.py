@@ -167,6 +167,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    supports_host_transfer: bool = False
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -284,6 +285,7 @@ class DeferredAbortAckState(msgspec.Struct):
 
 
 class CommonKVManager(BaseKVManager):
+    supports_host_transfer: bool = False
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
@@ -647,6 +649,7 @@ class CommonKVManager(BaseKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ) -> List[bytes]:
         raise NotImplementedError
 
@@ -1594,6 +1597,7 @@ class CommonKVManager(BaseKVManager):
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
+            "supports_host_transfer": self.supports_host_transfer,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
@@ -2469,6 +2473,7 @@ class CommonKVSender(BaseKVSender):
 
 
 class CommonKVReceiver(BaseKVReceiver):
+    destination: KVTransferDestination = KVTransferDestination.DEVICE
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
     _lifecycle_lock = nullcontext()
@@ -2852,18 +2857,33 @@ class CommonKVReceiver(BaseKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
-        if destination != KVTransferDestination.DEVICE:
+        if (
+            destination != KVTransferDestination.DEVICE
+            and not self.supports_host_destination
+        ):
             raise NotImplementedError("Host KV destinations are not supported")
+        self.destination = destination
+        if destination == KVTransferDestination.HOST:
+            # Host receives write directly to the registered host pool, even
+            # with heterogeneous TP; device staging/scatter cannot handle it.
+            self.require_staging = False
 
         self.chunk_staging_infos = []
         if (
-            self.kv_mgr.enable_staging
+            destination == KVTransferDestination.DEVICE
+            and self.kv_mgr.enable_staging
             and self.kv_mgr._staging_ctx.allocator is not None
         ):
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        # Device-only backends use the legacy builder signature.
+        destination_kwargs = (
+            {"destination": destination}
+            if destination != KVTransferDestination.DEVICE
+            else {}
+        )
         for bootstrap_info in self.bootstrap_infos:
             message = self.kv_mgr.build_receiver_metadata_message(
                 bootstrap_room=self.bootstrap_room,
@@ -2874,6 +2894,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 decode_prefix_len=decode_prefix_len,
                 is_dummy=bootstrap_info["is_dummy"],
                 device_kv_indices=device_kv_indices,
+                **destination_kwargs,
             )
             if not self._send_bootstrap_message(
                 bootstrap_info=bootstrap_info,
@@ -2940,10 +2961,15 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         if self.kv_mgr.defer_decode_allocation:
             self._owns_bootstrap_room = False
+        if self.destination == KVTransferDestination.HOST:
+            self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
-        self.clear()
+        # The host-receive queue owns its buffers until all remote writes have
+        # drained. Keep the room and ACK accounting until that owner clears it.
+        if self.destination != KVTransferDestination.HOST:
+            self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         raise KVTransferError(
@@ -2984,7 +3010,9 @@ class CommonKVReceiver(BaseKVReceiver):
         # but earlier ranks already hold destinations; those callers defer and
         # pass force_arm.
         if self.kv_mgr.enable_deferred_decode_kv_release and (
-            force_arm or self.init_time is not None
+            force_arm
+            or self.init_time is not None
+            or self.destination == KVTransferDestination.HOST
         ):
             self._abort_generation = self.kv_mgr.register_deferred_abort_room(
                 self.bootstrap_room
@@ -3173,6 +3201,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                supports_host_transfer=bool(data.get("supports_host_transfer", False)),
             )
 
             self._registered_count += 1

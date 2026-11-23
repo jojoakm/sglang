@@ -29,6 +29,8 @@ const ROOM_SHARD_COUNT: usize = 64;
 struct PrefillRankInfo {
     rank_ip: String,
     rank_port: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_host_transfer: Option<bool>,
 }
 
 /// Python's (`PrefillServerInfo`).
@@ -155,6 +157,7 @@ struct Route {
     rank_ip: String,
     #[serde(deserialize_with = "parse_int")]
     rank_port: i64,
+    supports_host_transfer: Option<bool>,
     #[serde(deserialize_with = "parse_int")]
     page_size: i64,
     #[serde(default)]
@@ -222,6 +225,7 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
             PrefillRankInfo {
                 rank_ip: body.rank_ip.clone(),
                 rank_port: body.rank_port,
+                supports_host_transfer: body.supports_host_transfer.filter(|enabled| *enabled),
             },
         );
         topo.registered_count += 1;
