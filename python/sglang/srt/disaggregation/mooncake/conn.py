@@ -122,6 +122,7 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
     destination: KVTransferDestination = KVTransferDestination.DEVICE
+    shared_main_v1: bool = dataclasses.field(default=False, kw_only=True)
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -137,6 +138,11 @@ class TransferInfo:
             dst_aux_index = int(msg[5].decode("ascii"))
             dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
+        destination = (
+            KVTransferDestination(msg[10].decode("ascii"))
+            if len(msg) > 10
+            else KVTransferDestination.DEVICE
+        )
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -144,6 +150,12 @@ class TransferInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_indices=dst_kv_indices,
             dst_aux_index=dst_aux_index,
+            shared_main_v1=(
+                not is_dummy
+                and len(msg) > 11
+                and destination == KVTransferDestination.HOST
+                and msg[11] == OWNER_MLA_V1
+            ),
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
@@ -155,11 +167,7 @@ class TransferInfo:
                 if len(msg) > 9 and msg[9] != b""
                 else None
             ),
-            destination=(
-                KVTransferDestination(msg[10].decode("ascii"))
-                if len(msg) > 10
-                else KVTransferDestination.DEVICE
-            ),
+            destination=destination,
         )
 
 
@@ -289,6 +297,50 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
+def _owned_mla_ptrs(manager, dst_ptrs, dst_tp_size, dst_item_len, dst_layer_ids):
+    """Identify whole registered target layers by their source pointer before native batching."""
+    kv = manager.kv_args
+    rank = manager.attn_tp_rank
+    if (
+        rank not in range(4)
+        or not manager.is_mla_backend
+        or (manager.pp_size, manager.attn_tp_size, dst_tp_size) != (1, 4, 4)
+        or kv.page_size != 64
+        or kv.num_draft_entries != 1
+        or kv.prefill_start_layer != 0
+        or kv.mla_compression_ratios is not None
+        or kv.kv_layer_ids
+        or dst_layer_ids
+    ):
+        raise ValueError("Expected the registered plain TP4 MLA layout")
+    # PP1 GLM records target layers in order, followed by one packed draft entry.
+    # Source and destination have independent virtual addresses and physical page IDs.
+    valid_ptrs = all(
+        len(ptrs) == 79 and len(set(ptrs)) == 79 and min(ptrs) > 0
+        for ptrs in (kv.kv_data_ptrs, dst_ptrs)
+    )
+    if (
+        not valid_ptrs
+        or list(kv.kv_item_lens) != [64 * 576] * 79
+        or dst_item_len != 64 * 576
+    ):
+        raise ValueError(
+            "Expected 78 target MLA buffers and one appended draft buffer on each peer"
+        )
+    return set(kv.kv_data_ptrs[rank:78:4]) | {kv.kv_data_ptrs[-1]}
+
+
+OWNER_MLA_V1 = b"sglang-q8-owner-mla78-tp4-v1"
+
+
+def _use_owner_mla_for_peer(manager, req, registration) -> bool:
+    if not (getattr(req, "shared_main_v1", False) and manager.enable_owner_mla_send):
+        return False
+    if manager.attn_tp_rank != registration.dst_tp_rank:
+        raise ValueError("Owner-layer send requires matching TP ranks")
+    return True
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
@@ -319,6 +371,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_owner_mla_send = envs.SGLANG_MOONCAKE_OWNER_MLA_SEND.get()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -1104,6 +1157,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_ptrs: Optional[set[int]] = None,
         dst_item_lens: list[int] | None = None,
         bootstrap_room: Optional[int] = None,
+        owned_ptrs: Optional[set[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -1239,6 +1293,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+        if owned_ptrs is not None:
+            layers_params = [entry for entry in layers_params if entry[0] in owned_ptrs]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -1425,6 +1481,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        *,
+        owner_mla: bool = False,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1463,6 +1521,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            owned_ptrs=(
+                _owned_mla_ptrs(
+                    self,
+                    dst_kv_ptrs,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                    dst_layer_ids,
+                )
+                if owner_mla
+                else None
+            ),
         )
 
     def send_kvcache_dcp(
@@ -2778,6 +2847,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                **(
+                                    {"owner_mla": True}
+                                    if _use_owner_mla_for_peer(
+                                        self, req, target_rank_registration_info
+                                    )
+                                    else {}
+                                ),
                             )
                         elif (
                             self.enable_staging
@@ -3371,7 +3447,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ) -> List[bytes]:
-        return [
+        message = [
             str(bootstrap_room).encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
@@ -3386,19 +3462,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             np.asarray(device_kv_indices, dtype=np.int32).tobytes()
             if not is_dummy and device_kv_indices is not None
             else b"",
-        ] + (
-            [destination.value.encode("ascii")]
-            if destination != KVTransferDestination.DEVICE
-            else []
-        ) + (
-            # The receiver has bound all four read-only peer views. Writes still go to
-            # the original rank-local buffers, including those sent by legacy senders.
-            [b"sglang-q8-owner-mla78-tp4-v1"]
-            if destination == KVTransferDestination.HOST
-            and not is_dummy
-            and getattr(self, "owner_layer_receive_ready", False)
-            else []
-        )
+        ]
+        if destination == KVTransferDestination.HOST:
+            message.append(destination.value.encode("ascii"))
+            if not is_dummy and getattr(self, "owner_layer_receive_ready", False):
+                message.append(OWNER_MLA_V1)
+        return message
 
 
 class MooncakeKVSender(CommonKVSender):

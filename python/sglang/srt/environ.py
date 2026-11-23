@@ -872,6 +872,8 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # Enable layer-owner sends only for peers advertising the per-room TP4 MLA layout.
+    SGLANG_MOONCAKE_OWNER_MLA_SEND = EnvBool(False)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
